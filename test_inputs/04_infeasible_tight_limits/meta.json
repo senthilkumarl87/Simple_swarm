@@ -1,0 +1,5 @@
+{
+  "name": "04_infeasible_tight_limits",
+  "description": "Fast path + tight limits. Expect the simulator to flag infeasibility.",
+  "expect_simulation": "fail"
+}

@@ -1,0 +1,7 @@
+{
+  "drones": [
+    {"drone_id": 1, "hw_id": 1, "ip": "udp://:14540", "port": 14540, "is_leader": true},
+    {"drone_id": 2, "hw_id": 2, "ip": "udp://:14541", "port": 14541, "is_leader": false},
+    {"drone_id": 3, "hw_id": 3, "ip": "udp://:14542", "port": 14542, "is_leader": false}
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "02_circle_auto_heading",
+  "description": "Circle with heading column omitted; generator must derive tangent heading.",
+  "expect_simulation": "ok",
+  "expect_peak_err_max": 1.5,
+  "expect_min_sep_min": 1.0
+}

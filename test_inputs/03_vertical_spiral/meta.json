@@ -1,0 +1,7 @@
+{
+  "name": "03_vertical_spiral",
+  "description": "Helical leader path with climbing altitude. Tests vertical tracking.",
+  "expect_simulation": "ok",
+  "expect_peak_err_max": 2.0,
+  "expect_min_sep_min": 0.8
+}

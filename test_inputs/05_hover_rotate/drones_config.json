@@ -1,0 +1,60 @@
+{
+  "drones": [
+    {
+      "drone_id": 1,
+      "hw_id": 1,
+      "ip": "udp://:14540",
+      "port": 14540,
+      "is_leader": true
+    },
+    {
+      "drone_id": 2,
+      "hw_id": 2,
+      "ip": "udp://:14541",
+      "port": 14541,
+      "is_leader": false
+    },
+    {
+      "drone_id": 3,
+      "hw_id": 3,
+      "ip": "udp://:14542",
+      "port": 14542,
+      "is_leader": false
+    },
+    {
+      "drone_id": 4,
+      "hw_id": 4,
+      "ip": "udp://:14543",
+      "port": 14543,
+      "is_leader": false
+    },
+    {
+      "drone_id": 5,
+      "hw_id": 5,
+      "ip": "udp://:14544",
+      "port": 14544,
+      "is_leader": false
+    },
+    {
+      "drone_id": 6,
+      "hw_id": 6,
+      "ip": "udp://:14545",
+      "port": 14545,
+      "is_leader": false
+    },
+    {
+      "drone_id": 7,
+      "hw_id": 7,
+      "ip": "udp://:14546",
+      "port": 14546,
+      "is_leader": false
+    },
+    {
+      "drone_id": 8,
+      "hw_id": 8,
+      "ip": "udp://:14547",
+      "port": 14547,
+      "is_leader": false
+    }
+  ]
+}

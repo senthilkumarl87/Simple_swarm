@@ -1,0 +1,7 @@
+{
+  "name": "05_hover_rotate",
+  "description": "Leader hovers and rotates; 7 followers on a ring must orbit around it.",
+  "expect_simulation": "ok",
+  "expect_peak_err_max": 1.5,
+  "expect_min_sep_min": 2.5
+}

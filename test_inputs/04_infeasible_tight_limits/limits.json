@@ -1,0 +1,7 @@
+{
+  "max_speed_xy": 2.0,
+  "max_speed_up": 1.0,
+  "max_accel_xy": 1.0,
+  "max_accel_z": 0.5,
+  "max_yaw_rate": 0.2
+}
