@@ -9,7 +9,7 @@ plumbing unchanged; only the control loop differs: instead of one fixed leader
 driving a rigid rotating formation, every drone's master eligibility, suitability
 score, and local flocking force are computed centrally each tick from REAL MAVSDK
 telemetry -- but using only the information a drone would actually have in a
-decentralized deployment (neighbors within --comm-range). This is a centralized
+decentralized deployment (neighbors within --comm-range-lora). This is a centralized
 simulator of a decentralized algorithm, same pattern as swarm_sim_core.py itself,
 just driven by real vehicle telemetry/dynamics instead of simulated physics. See
 UAV_Swarm_Update_Claude_Code_Spec.md, Appendix C, Phase 3/4 for where this sits on
@@ -17,13 +17,13 @@ the hardware-implementation roadmap.
 
 SCOPE OF THIS FIRST PASS (not yet done -- see Appendix C Phase 5):
   - No real inter-UAV comm layer; comm_graph is computed centrally from real GPS
-    positions against --comm-range, not from an actual radio/mesh link budget.
+    positions against --comm-range-lora, not from an actual radio/mesh link budget.
   - No independent ranging sensor behind the eligibility gate's d_AB -- see the
     docstring in swarm_election.py for exactly what this does and doesn't defend
     against as a result.
   - No neighbor-influence decay / link-failure-timeout state machine (Sec. 6);
     a neighbor silently drops out of the flocking force the instant it leaves
-    --comm-range, rather than decaying over NEIGHBOR_INFLUENCE_DECAY_WINDOW.
+    --comm-range-lora, rather than decaying over NEIGHBOR_INFLUENCE_DECAY_WINDOW.
   - No automatic RTH on isolation timeout.
   - Merge reconciliation on partition rejoin is implicit (the tie-break chain
     naturally promotes the single highest-scoring eligible candidate across the
@@ -122,7 +122,7 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
     tick = 0
 
     election = ElectionState()
-    params = ElectionParams(comm_range=args.comm_range)
+    params = ElectionParams(comm_range_lora=args.comm_range_lora, comm_range_wifi=args.comm_range_wifi)
 
     isolate_windows = {hw_id: (t0, t1) for hw_id, t0, t1 in args.isolate}
 
@@ -131,7 +131,8 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
     last_master_print: dict[int, int] = {}
 
     print(f"[ctrl] dynamic election + flocking running at {args.control_rate} Hz "
-          f"for {args.duration or '∞'}s, comm_range={args.comm_range}m")
+          f"for {args.duration or '∞'}s, comm_range_lora={args.comm_range_lora}m "
+          f"comm_range_wifi={args.comm_range_wifi or 'absent'}m")
 
     while not stop.is_set():
         now = time.monotonic()
@@ -142,7 +143,7 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         # Comm graph: exclude drones currently inside an --isolate window.
         isolated_now = {hw_id for hw_id, (t0, t1) in isolate_windows.items() if t0 <= t_rel < t1}
         live_states = {i: s for i, s in states.items() if i not in isolated_now}
-        adj = comm_graph(live_states, params.comm_range)
+        adj = comm_graph(live_states, params.comm_range_lora)    # PRIMARY link only -- see swarm_election.py docstring
 
         for cluster_ids in clusters(adj):
             master = election.run_election(cluster_ids, live_states, adj, params, t_rel, "periodic")
@@ -293,7 +294,11 @@ async def run(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", type=Path, required=True, help="drones_config.json (is_leader field ignored)")
-    p.add_argument("--comm-range", type=float, default=30.0, help="m, horizontal direct-link range for the comm graph")
+    p.add_argument("--comm-range-lora", type=float, default=30.0,
+                    help="m, PRIMARY (LoRa) link range -- election/eligibility/flocking all key to this")
+    p.add_argument("--comm-range-wifi", type=float, default=0.0,
+                    help="m, OPTIONAL accelerant link range; 0 = absent (default). Not yet wired into any "
+                         "function -- reserved for a future opportunistic bulk-transfer speedup.")
     p.add_argument("--goal-n", type=float, default=20.0, help="m, shared goal offset (north) from each drone's own start position")
     p.add_argument("--goal-e", type=float, default=0.0, help="m, shared goal offset (east) from each drone's own start position")
     p.add_argument("--takeoff-alt", type=float, default=10.0)

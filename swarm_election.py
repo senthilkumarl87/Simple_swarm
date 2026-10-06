@@ -23,6 +23,15 @@ d_hat_AB -- the gate is exercised and testable (via --byzantine fault injection,
 which applies a synthetic offset to a drone's self-report only) but is NOT a real
 Byzantine/GPS-spoofing defense until a real independent ranging source replaces
 this. Documented here rather than silently assumed to work.
+
+RADIO MODEL (Appendix C, Phase 2): Tomoto (LoRa) is the PRIMARY link and must be
+sufficient on its own -- comm_graph(), election, eligibility, and flocking are all
+keyed to comm_range_lora. WiFi is OPTIONAL: comm_range_wifi defaults to 0 (absent),
+and nothing in this module requires it. Where this module is extended for bulk
+state transfer (merge reconciliation's D_merged), that must work over LoRa alone
+as the baseline, with WiFi used only opportunistically as a speedup -- see
+wifi_graph() below, kept separate from comm_graph() on purpose so a caller can
+never accidentally make correctness depend on it.
 """
 
 from __future__ import annotations
@@ -35,7 +44,8 @@ import numpy as np
 
 @dataclass
 class ElectionParams:
-    comm_range: float = 150.0               # m, direct link range (horizontal)
+    comm_range_lora: float = 150.0          # m, PRIMARY link -- election/eligibility/flocking all key to this
+    comm_range_wifi: float = 0.0            # m, OPTIONAL accelerant; 0 = absent. Never required for correctness.
     max_relay_hops: int = 1                  # centralized sim: no real multi-hop relay yet
 
     MASTER_SWITCH_MARGIN: float = 0.05
@@ -79,6 +89,9 @@ class DroneState:
 # ---------------------------------------------------------------- comm graph ----
 
 def comm_graph(states: dict[int, DroneState], comm_range: float) -> dict[int, set[int]]:
+    """The PRIMARY (LoRa) link graph. Election, eligibility, and flocking are all
+    computed against this -- call with p.comm_range_lora. Must never be called with
+    the optional WiFi range in place of this; use wifi_graph() for that."""
     ids = [i for i, s in states.items() if s.healthy]
     adj = {i: set() for i in ids}
     for i, j in itertools.combinations(ids, 2):
@@ -87,6 +100,18 @@ def comm_graph(states: dict[int, DroneState], comm_range: float) -> dict[int, se
             adj[i].add(j)
             adj[j].add(i)
     return adj
+
+
+def wifi_graph(states: dict[int, DroneState], comm_range_wifi: float) -> dict[int, set[int]]:
+    """The OPTIONAL (WiFi) accelerant graph. Empty whenever comm_range_wifi <= 0
+    (WiFi absent), by construction -- a caller that only ever consults this when
+    it's non-empty can't accidentally make correctness depend on WiFi being
+    present. Intended use: check `j in wifi_graph(...).get(i, set())` before
+    attempting a fast bulk transfer (e.g. merge reconciliation's D_merged); fall
+    back to a chunked transfer over the LoRa link otherwise."""
+    if comm_range_wifi <= 0:
+        return {i: set() for i in states}
+    return comm_graph(states, comm_range_wifi)
 
 
 def clusters(adj: dict[int, set[int]]) -> list[set[int]]:
@@ -131,7 +156,7 @@ def suitability_score(cluster_ids, states: dict[int, DroneState], adj, eligible:
                        p: ElectionParams) -> dict[int, float]:
     """swarm_sim_core.py::_suitability_score."""
     centroid = np.mean([states[i].pos for i in cluster_ids], axis=0)
-    max_dist = p.comm_range * p.max_relay_hops
+    max_dist = p.comm_range_lora * p.max_relay_hops
     scores = {}
     for i in cluster_ids:
         s = states[i]
