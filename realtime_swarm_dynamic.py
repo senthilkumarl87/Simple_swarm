@@ -106,7 +106,12 @@ async def drone_state_tracker(hw_id: int, drone: System, state: DroneState, upda
     async def battery():
         try:
             async for b in drone.telemetry.battery():
-                state.energy = float(np.clip(b.remaining_percent, 0.0, 1.0))
+                # remaining_percent is already 0-100, not a 0-1 fraction -- confirmed via
+                # Phase 1's live Gazebo test, which printed "8400%" before this fix. Without
+                # the /100, np.clip(..., 0.0, 1.0) silently clamped every drone's energy to
+                # 1.0 regardless of actual battery level, so the election's E_i term was
+                # never actually exercised in the earlier SITL dynamic-election runs.
+                state.energy = float(np.clip(b.remaining_percent / 100.0, 0.0, 1.0))
         except Exception:
             pass    # SITL battery plugin not always present -- keep default 1.0
 
