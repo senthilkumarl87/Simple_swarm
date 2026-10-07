@@ -97,7 +97,9 @@ python3 realtime_swarm_dynamic.py --config <3-drone config> --port-base 50040 \
 Result (2026-10-07): all 3 drones took off, elected hw_id 1, then organically (no injected fault)
 periodic-re-elected to hw_id 3 at t=14.1s as scores shifted, briefly partitioned (hw_id 3 isolated at t=19.9s),
 and merged back to hw_id 1 at t=21.5s -- real election/partition/merge dynamics in live Gazebo physics, not
-fault-injected. One real safety finding, not glossed over: minimum pairwise separation reached 0.66m mid-flight
-(excluding the known co-spawn artifact at t=0), tighter than the obstacle test's 5-6m margins -- plausibly tied to
-the partition event reducing effective repulsion responsiveness. Open item: flocking-parameter tuning under real
-election dynamics specifically, not just static scenarios.
+fault-injected. Separation during the partition window itself stayed comfortably large (14.4-19.8m) -- no
+tightening at all. (A first pass at this writeup mis-measured a "0.66m mid-flight" separation and speculated it
+was tied to the partition; re-checked, it was actually just a later sample of the same already-documented t=0
+co-spawn recovery curve, which keeps monotonically opening from 0.08m at t≈0.6s through 2.54m at t=5s, 5.1m at
+t=7s, and settling at 9m+ by t=8s -- not a new or election-correlated event. Corrected here rather than left
+standing.) True steady-state separation (t>8s) stayed in the 9-24m range for the whole flight.
