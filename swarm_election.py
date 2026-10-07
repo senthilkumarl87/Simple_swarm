@@ -415,7 +415,22 @@ class ElectionState:
                       p: ElectionParams, t: float, reason: str):
         cluster_ids = sorted(cluster_ids)
         eligible_map = eligibility_vote(cluster_ids, states, adj, p)
-        eligible_ids = [i for i in cluster_ids if eligible_map[i]]
+        # Hard eligibility floor: a drone with rth=True is committed to leaving
+        # (armed, physically flying RETURN_TO_LAUNCH) and must not be elected or
+        # remain master -- found as a real gap, not assumed: rth/degraded_mode
+        # were wired into flock_force (Phase 5) but nothing had ever excluded an
+        # RTH'd drone from candidacy, so one could reconnect mid-flight-home and
+        # win a merge's tie-break. degraded_mode alone is NOT excluded here: an
+        # isolated (degraded_mode=True, rth=False) drone is by definition its own
+        # singleton cluster with no other candidate to lose to, and needs to
+        # remain its own master to keep operating autonomously -- excluding it
+        # would leave it masterless for no reason. This is the one hard
+        # pre-score cutoff from the original architecture brief (spec.md
+        # Appendix C / proposal Section 11's "soft, not hard, eligibility
+        # floors" limitation) that is actually enforceable without a real
+        # ranging sensor or a real energy-reserve policy decision -- the other
+        # two (min energy reserve, min connectivity) stay open, unchanged.
+        eligible_ids = [i for i in cluster_ids if eligible_map[i] and not states[i].rth]
 
         # Collect EVERY distinct former master still present in this cluster, not
         # just the first one found -- when a partition heals, both sides' former
