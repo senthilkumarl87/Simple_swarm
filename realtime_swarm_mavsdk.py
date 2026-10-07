@@ -60,6 +60,7 @@ import pandas as pd
 
 try:
     from mavsdk import System
+    from mavsdk.action import ActionError
     from mavsdk.offboard import OffboardError, PositionNedYaw, VelocityNedYaw
 except ImportError:
     print("Error: mavsdk not installed. Install with: pip install mavsdk", file=sys.stderr)
@@ -259,11 +260,18 @@ async def arm_and_offboard_takeoff(hw_id: int, drone: System, alt: float):
         pass    # not supported on all vehicles; harmless to skip
 
     # Skip if already airborne (e.g. re-running the controller mid-flight).
+    # Cross-check against `armed` too, not just `in_air()` alone: a fresh
+    # System() connection's first in_air() read can be stale/wrong (found by
+    # hitting this directly -- a vehicle that was actually disarmed on the
+    # ground read in_air=True once right after reconnecting, got skipped here,
+    # and then sat motionless for the whole run while the others flew).
     async for v in drone.telemetry.in_air():
-        if v:
-            print(f"[hw_id {hw_id}] already in air")
-            return
-        break
+        in_air = v; break
+    async for v in drone.telemetry.armed():
+        armed = v; break
+    if in_air and armed:
+        print(f"[hw_id {hw_id}] already in air")
+        return
 
     # Snapshot current ground position
     init = None
@@ -275,8 +283,30 @@ async def arm_and_offboard_takeoff(hw_id: int, drone: System, alt: float):
     await drone.offboard.set_position_ned(
         PositionNedYaw(n0, e0, -alt, 0.0))
 
-    # Arm + engage offboard
-    await drone.action.arm()
+    # Arm + engage offboard. Retry arm() a few times: PX4 can transiently deny
+    # arming (COMMAND_DENIED) under CPU contention during a multi-vehicle
+    # SITL/Gazebo startup (prearm checks settling, e.g. the "High Accelerometer
+    # Bias" false-positive) even once telemetry.health() reports armable=True
+    # moments later -- found by hitting this directly in a 3-drone Gazebo run.
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        try:
+            await drone.action.arm()
+            break
+        except ActionError as e:
+            if attempt == max_attempts - 1:
+                raise
+            print(f"[hw_id {hw_id}] arm() denied ({e}), retrying...")
+            await asyncio.sleep(3.0)
+            # Refresh the setpoint: a long arm-retry wait lets PX4's offboard
+            # setpoint timeout lapse, and start() then fails with
+            # NO_SETPOINT_SET even though arm() itself just succeeded --
+            # found by hitting this directly after the arm-retry fix above
+            # made long waits actually happen.
+            await drone.offboard.set_position_ned(
+                PositionNedYaw(n0, e0, -alt, 0.0))
+    await drone.offboard.set_position_ned(
+        PositionNedYaw(n0, e0, -alt, 0.0))
     try:
         await drone.offboard.start()
     except OffboardError as e:

@@ -31,10 +31,16 @@ for i in $(seq 0 $((N - 1))); do
   if [ "$i" -eq 0 ]; then
     sleep 8     # let the first instance finish launching gz sim + the static world
   else
-    sleep 18    # the critical gap -- 4s reproduced the sensor-attachment bug on
-                # the last instance; 18s has been reliable so far. Not yet
-                # root-caused further than "needs to settle longer than a few
-                # seconds"; treat this number as empirical, not derived.
+    sleep 25    # the critical gap -- 4s reproduced the sensor-attachment bug on
+                # the last instance; 18s was reliable for global_pos_ok/
+                # home_pos_ok but NOT sufficient to prevent occasional
+                # persistent (60s+) arm() COMMAND_DENIED on a RANDOM instance
+                # (not always the same slot across runs -- evidence this is
+                # CPU-contention jitter during startup, not a per-slot bug).
+                # Bumped empirically; still not root-caused further than
+                # "needs more settle time," treat as empirical, not derived.
   fi
 done
+echo "all $N instances launched -- settling further before any arm attempt..."
+sleep 15
 echo "all $N instances launched, attached to the static world's pre-declared models"
