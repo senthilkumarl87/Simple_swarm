@@ -13,11 +13,20 @@ core math:
 3. **Option B — real-time, MAVSDK-in-the-loop** — a single process owns
    MAVSDK connections to every drone (or SITL instance), subscribes to the
    leader's telemetry, computes setpoints, and pushes them via offboard mode.
+4. **Option D — dynamic master election + three-force flocking** (§16) —
+   same one-process/MAVSDK-in-the-loop shape as Option B, but with no fixed
+   leader: every drone runs the same decentralized election + flocking logic
+   every control tick, closing Option B's own §10.4 limitation ("single
+   process = single point of failure... every follower falls back on
+   whatever PX4 does when offboard stream stops").
 
 The offline tier is self-contained (no MAVSDK, no sockets). Option C uses
-loopback UDP only. Option B talks to `mavsdk_server` instances connected to
-PX4. Every tier shares the same rotation math (§5.2) and the same output CSV
-schema (§5.5), so the visualizer / animator work on any stage's logs.
+loopback UDP only. Option B and Option D both talk to `mavsdk_server`
+instances connected to PX4. Every tier shares the same rotation math (§5.2)
+and the same output CSV schema (§5.5), so the visualizer / animator work on
+any stage's logs — Option D's own CSV output is covered in §16.8, not §1.4:
+same per-drone position/velocity/yaw columns, but master/tier/election
+events are separate files (there is no "leader" to express an offset from).
 
 ---
 
@@ -816,7 +825,11 @@ to convert a scenario into a sharper regression check.
 
 - **Single process = single point of failure.** If the controller process
   dies, every follower falls back on whatever PX4 does when offboard
-  stream stops (typically hover, then RTL if `COM_OBL_ACT` is set).
+  stream stops (typically hover, then RTL if `COM_OBL_ACT` is set). Option D
+  (§16) was built specifically to address the *logical* single-leader half
+  of this (no fixed master to lose) by electing a new master among
+  survivors; it does not remove the *process* single point of failure, since
+  it is still one process computing every drone's election + flocking (§16.14).
 - **No onboard saturation or PD here.** We rely on PX4's position
   controller and whatever parameter limits (`MPC_XY_VEL_MAX`, etc.) you
   have set. Make sure those match your airframe before flying.
@@ -848,6 +861,21 @@ Simple_swarm/
 ├── run_realtime_demo.py         # option C: orchestrator
 │
 ├── realtime_swarm_mavsdk.py     # option B: centralized MAVSDK controller
+│                                 #   (also option D's connect/arm/takeoff/
+│                                 #    shutdown/logging plumbing, reused via import)
+│
+├── swarm_election.py            # option D: election/flocking engine, no MAVSDK dependency (§16.3)
+├── realtime_swarm_dynamic.py    # option D: MAVSDK entrypoint, dynamic election + flocking control loop
+├── phase1_gazebo_single_vehicle.py       # option D: single-vehicle Gazebo lifecycle validation
+├── phase1_offboard_loss_followup.py      # option D: real mavsdk_server-kill link-loss validation
+├── gz_worlds/                   # option D: Gazebo worlds + launch scripts (§16.12)
+│   ├── multi_x500_static.sdf
+│   ├── obstacle_test.sdf
+│   ├── launch_multi_gazebo_static.sh
+│   └── README.md
+├── tests/                       # option D: unit tests for swarm_election.py (§16.13)
+│   ├── run_all.sh
+│   └── test_*.py
 │
 ├── _gen_test_inputs.py          # regenerates test_inputs/
 ├── run_tests.py                 # offline regression runner
@@ -1563,4 +1591,402 @@ comparison hierarchy is:
    (see §14.13).
 3. **Log shows alt=0 / in_air=False?** — arming or offboard didn't
    engage; inspect `/tmp/mavsdk_server_<N>.log` and the PX4 console
+   window for that drone.
+
+---
+
+## 16. Option D — Dynamic master election + three-force flocking
+
+Option B (§7.3/§10.4) has exactly one leader, fixed in `drones_config.json`
+for the life of the process; if that drone (or the controller process
+computing its setpoints) goes away, nothing re-elects a replacement.
+Option D removes the *fixed-leader* half of that: there is no `is_leader`
+field at all, no designated drone — every drone runs the same decentralized
+suitability-score election with hysteresis every control tick, and whichever
+currently-reachable drone has the best score is master. The architecture
+brief this was built from explicitly frames it as updating a "single process
+= single point of failure" fixed-master design — Option B's own §10.4 wording
+is almost verbatim what motivated this.
+
+What Option D does **not** change from Option B: still one Python process
+per swarm, still `mavsdk_server` per drone, still `offboard.set_position_velocity_ned()`
+as the actuation path, still no onboard PD/saturation (PX4's position
+controller does that). It reuses Option B's connect/arm/takeoff/shutdown/
+logging plumbing directly via `import realtime_swarm_mavsdk` rather than
+duplicating it.
+
+### 16.1 Architecture
+
+```
+                 realtime_swarm_dynamic.py (ONE process)
+              ┌────────────────────────────────────────────────┐
+              │ connect_drone() / arm_and_offboard_takeoff()    │  ← from realtime_swarm_mavsdk.py
+              │ per hw_id in config (no is_leader field used)   │
+              │                                                  │
+              │ per-drone telemetry pollers → DroneState         │
+              │   (pos, vel, energy, compute_capacity, ...)      │
+              │                                                  │
+              │ control loop @ --control-rate Hz, per tick:      │
+              │   comm_graph()         LoRa-range adjacency      │
+              │   update_neighbor_link_state()   decay/throttle  │
+              │   update_isolation_rth()          degraded/RTH   │
+              │   clusters()           connected components      │
+              │   ElectionState.run_election()    per cluster    │
+              │     └─ eligibility_vote() → suitability_score()  │
+              │        → tie_break_key()                         │
+              │     └─ merge detection → MergeState (§16.9)      │
+              │   flock_force()        per drone (§16.7)         │
+              │   offboard.set_position_velocity_ned(...)        │
+              │                                                  │
+              │ graceful_shutdown(): stop offboard, optional land │
+              └────────────────────────────────────────────────┘
+                 │        │        │              │
+                 ▼        ▼        ▼              ▼
+              mavsdk_srv mavsdk_srv mavsdk_srv  mavsdk_srv
+                 │        │        │              │
+               PX4(1)   PX4(2)   PX4(3)   ...   PX4(N)
+              (SITL or real vehicles)
+```
+
+### 16.2 Why "dynamic" — periodic *and* event-driven re-election
+
+Two separate triggers call `ElectionState.run_election()` every tick's
+cluster loop:
+
+- **Periodic**: every drone's suitability score is recomputed and the best
+  candidate re-checked on a fixed cadence (independent of faults — this is
+  what keeps a drone from permanently monopolizing the master role as its
+  own energy/position/connectivity factors change over a long mission).
+- **Event-driven**: a drone going unreachable, isolated, or RTH-triggered
+  removes it from `eligible_ids` immediately rather than waiting for the
+  next periodic check.
+
+Hysteresis (`MASTER_SWITCH_MARGIN=0.05`, `MASTER_MIN_HOLD_TIME=5.0s`) keeps
+a narrowly-better candidate from flapping the master role back and forth —
+a switch only happens if the challenger's score beats the incumbent's by
+more than the margin, and (for event-driven triggers specifically) the
+incumbent has held the role for at least the minimum hold time.
+
+### 16.3 Files
+
+| File | Role |
+|---|---|
+| `swarm_election.py` | Pure logic, **no MAVSDK import at all** — election, eligibility, flocking, comm graphs, merge reconciliation, degradation tiers, RTH. Importable and unit-testable with no SITL running. |
+| `realtime_swarm_dynamic.py` | The MAVSDK entrypoint: CLI, per-drone telemetry pollers, the control loop, fault-injection flags, CSV/event logging. |
+| `realtime_swarm_mavsdk.py` | Shared with Option B: `connect_drone()`, `arm_and_offboard_takeoff()`, `wait_gps_ok()`, `force_qgc_broadcast()`, `telemetry_logger_task()`, `graceful_shutdown()`. |
+| `gz_worlds/` | Gazebo worlds + launch tooling for validating Option D specifically (multi-vehicle election/flocking, obstacle avoidance) — see §16.12. |
+| `tests/` | 28 unit-test assertions against `swarm_election.py` directly, no SITL needed — see §16.13. |
+| `phase1_gazebo_single_vehicle.py`, `phase1_offboard_loss_followup.py` | Standalone single-vehicle Gazebo validation scripts (lifecycle, setpoint-lapse, and real `mavsdk_server`-kill link-loss behavior) that informed Option D's design but don't depend on `swarm_election.py` themselves. |
+
+### 16.4 Election: suitability score, eligibility, tie-break
+
+`suitability_score()` (one call per cluster per election) computes, per
+candidate `i`:
+
+```
+S_i = w_E·E_i + w_P·P_i + w_C·C_i + w_L·L_i
+
+E_i = clip(energy_i, 0, 1)                                    # battery, 0..1
+P_i = clip(1 - |pos_i - cluster_centroid| / (comm_range_lora * max_relay_hops), 0, 1)
+C_i = clip(verified_neighbors_i / (|cluster| - 1), 0, 1)       # fraction of cluster mates
+                                                                # it can reach AND that passed
+                                                                # the eligibility vote
+L_i = clip(compute_capacity_i, 0, 1)                           # companion-PC headroom
+```
+
+Default weights: `w_E=0.40, w_P=0.25, w_C=0.25, w_L=0.10`. Ties (and
+near-ties within the hysteresis margin) are broken deterministically by
+`tie_break_key()`: `(score, verified_neighbor_count, energy, -hw_id)` —
+highest score wins, then most-verified-neighbors, then most energy, then
+lowest hw_id, so every drone computing this independently always agrees.
+
+**Hard eligibility floor**: `rth=True` is excluded from `eligible_ids`
+entirely — a drone mid-return-to-launch cannot become (or remain) master,
+found as a live bug (it could otherwise reconnect mid-flight-home and win a
+merge's tie-break). `degraded_mode` alone does **not** exclude a drone: an
+isolated drone is its own singleton cluster by definition and needs to stay
+its own master to keep operating autonomously.
+
+**Still soft, not hard** (a known, named gap against the original
+architecture brief, which specified these as hard pre-score cutoffs): a
+minimum energy reserve and a minimum connectivity floor. Both are *inputs*
+to the score (`w_E·E_i`, `w_C·C_i`) but neither has a hard cutoff — this
+needs a policy threshold decision that hasn't been made, not an
+implementation gap.
+
+### 16.5 Eligibility vote — pairwise distance-consistency (Byzantine/spoofing detection)
+
+`eligibility_vote()` checks, for every directly-connected pair in a
+cluster: does the pair's *reported* position difference match the
+*measured* distance between them (within `eligibility_tau=2.0m`)? If not,
+**both** endpoints of that one inconsistent pair lose a vote (not just the
+"guilty" one — there is no independent arbiter to decide which one is
+lying from the pair alone). A drone that fails too many such checks against
+its neighbors is excluded from `eligible_ids`.
+
+`measured_distance()` is the one function standing in for a real ranging
+sensor: `ranging_available=False` by default, and setting it `True` without
+a real sensor behind it (Tomoto/LoRa has none, confirmed) raises loudly at
+call time rather than silently lying to the gate.
+
+**Known, named limitation**: because both ends of a noisy pair lose a vote,
+a single honest drone paired against one genuinely spoofing neighbor can
+become collaterally ineligible alongside the spoofer, in the degenerate
+2-drone-cluster case especially. Attributing fault to just the liar would
+need either a third independent peer's corroborating measurement or an
+external arbiter — neither exists yet.
+
+### 16.6 Communication model — LoRa-primary, WiFi-optional
+
+Built around the project's actual chosen radio hardware: an in-house LoRa
+module ("Tomoto") for drone-to-drone comms, with an optional WiFi module on
+the companion PC as a pure accelerant.
+
+- `comm_range_lora` (default 30m in `realtime_swarm_dynamic.py`, 150m in
+  `ElectionParams`'s own default) is the **primary, required** link —
+  election, eligibility voting, and flocking's comm graph are all built on
+  it alone. Nothing may assume WiFi is present.
+- `comm_range_wifi` (default 0 = absent) is an **optional accelerant only**:
+  currently used solely to speed up a merge's bulk `D_merged` payload
+  transfer (§16.9) when the winner and loser also happen to be in WiFi
+  range of each other. Everything else ignores it entirely.
+- `max_relay_hops=1`: Tomoto is confirmed broadcast-only with no addressed
+  routing layer, so a drone can only directly hear others within
+  `comm_range_lora` — there is no multi-hop relay to model, and 1 is the
+  physically correct value here, not a placeholder.
+- `lora_broadcast_interval` (default 0 = continuous/live, a WiFi-like
+  idealization) models Tomoto's real, much lower broadcast rate when set
+  `>0`: a drone only actually *receives* a given neighbor's latest state
+  every `lora_broadcast_interval` seconds, not every tick — `flock_force()`
+  then reads throttled, possibly-stale state for still-in-range neighbors,
+  not just post-disconnect ones. `update_neighbor_link_state()` must be
+  called once per tick for the throttle to take effect.
+
+**Known, named limitation**: `lora_bandwidth_bps` (1000, a conservative
+placeholder) and Tomoto's real duty-cycle/airtime budget are both
+uncharacterized against actual hardware — these parameters exist so the
+timing *mechanism* (merge payload chunking, broadcast throttling) can be
+built and tested now, not because the numbers are validated.
+
+### 16.7 Three-force local flocking + obstacle avoidance
+
+`flock_force()` — independent of election state, runs for every healthy
+drone every tick regardless of who's master — sums:
+
+```
+total = f_goal + f_rep + alignment_gain·f_align + f_coh + f_obs      (normal)
+total = f_goal + f_rep + f_obs                                       (degraded_mode: no cohesion/alignment)
+```
+
+- **f_goal**: unit vector toward the drone's own goal.
+- **f_rep** (repulsion, safety-critical): active within `D_rep=8.0m`,
+  magnitude `repulsion_gain·(D_rep - d)/max(d, 0.5)`. Weighted by each
+  neighbor's decayed `neighbor_influence` (§16.8). Exact-zero-distance
+  neighbors get a deterministic (hash-based, not random, so runs stay
+  reproducible) escape direction rather than a zero force — two coincident
+  vehicles need *some* direction to separate along.
+- **f_coh** (cohesion): active beyond `cohesion_start=10.0m`, capped at
+  `cohesion_max=40.0m`, averaged over contributing neighbors weighted by
+  influence (a fully-decayed stale neighbor contributes 0 to both the
+  numerator *and* the averaging denominator, not just the numerator).
+- **f_align** (alignment): active within `alignment_max_dist=25.0m`, pulls
+  velocity toward neighbors', weighted by both distance and influence.
+- **f_obs** (obstacle avoidance, `obstacle_force()`): same force-law shape
+  as `f_rep`, against `--obstacle N:E:RADIUS` positions passed on the CLI.
+  Obstacle positions are **known/configured, not sensed live** — no
+  lidar/depth-camera integration exists yet; swapping in real onboard
+  sensing is a separate, future step. Same deterministic-escape-direction
+  treatment at the obstacle's exact center.
+
+Total force is clamped to `max_accel=3.0 m/s²`, and the resulting velocity
+to `max_speed=4.0 m/s`, before being sent as the offboard setpoint.
+
+**Known, named limitation**: no damping/braking term near the goal —
+`f_goal` stays full-magnitude at every nonzero distance and only reaches
+zero exactly *at* the goal, so a drone arriving with nonzero velocity
+overshoots and oscillates rather than settling. Observed directly in a real
+multi-drone Gazebo flight (§16.12).
+
+### 16.8 Link-failure handling: neighbor decay, degradation tiers, isolation → RTH
+
+Ported from the companion research project's already-validated abstract
+simulation (`swarm_sim_core.py`, a separate 2D reference implementation —
+not part of this repo), function-for-function:
+
+- **Neighbor-influence decay** (`update_neighbor_link_state()`): a neighbor
+  that drops out of `comm_range_lora` holds its last-known (frozen) state
+  and ramps its flocking-force weight linearly to 0 over
+  `NEIGHBOR_INFLUENCE_DECAY_WINDOW=1.0s`, rather than vanishing the instant
+  it's unreachable — avoiding the force discontinuity a hard cutoff would
+  introduce. Past `NEIGHBOR_STATE_TIMEOUT=2.0s` it's fully excluded.
+  `--no-neighbor-decay` reproduces the old hard-cutoff behavior as an
+  ablation baseline.
+- **Degradation tiers** (`tier_of()`): classifies every drone each tick as
+  `full` (direct link to its cluster's master), `relay` (in the main
+  cluster, reaches the master only indirectly), `partition` (a smaller,
+  valid sub-cluster, not the main one — e.g. both sides of a network split),
+  or `isolated` (zero reachable neighbors). Surfaced in the live `[status]`
+  log line.
+- **Isolation → degraded_mode → RTH** (`update_isolation_rth()`): zero
+  reachable neighbors sets `degraded_mode=True` immediately (flocking drops
+  cohesion/alignment, §16.7); past `ISOLATION_RTH_TIMEOUT=6.0s` isolated,
+  `rth=True` fires. `realtime_swarm_dynamic.py` watches this flag's
+  False→True transition and calls the **real** MAVSDK
+  `action.return_to_launch()` — not a simulated flag — with a bounded retry
+  on failure (a failed call used to permanently strand the drone with no
+  setpoints and no retry; fixed). Reconnecting clears `degraded_mode`,
+  `isolated_since`, *and* `rth` — all three, matching the function's own
+  docstring (a real bug where `rth` alone didn't clear was found and fixed
+  via a test-quality review, §16.13).
+
+### 16.9 Partition and merge reconciliation
+
+When a comm-graph split later reconnects into one cluster containing more
+than one distinct former master, `ElectionState.run_election()` detects the
+merge (checked *before* any early-return branch — an earlier version
+returned early when the merge winner happened to equal an arbitrary
+"representative" former master, which re-detected the same merge every
+tick forever; fixed) and creates a `MergeState` for the losing side: a
+chunked bulk transfer of `merge_payload_bytes` (a placeholder — the real
+task-allocation feature that would define this payload doesn't exist yet),
+paced by `lora_bandwidth_bps` by default and sped up opportunistically over
+`wifi_bandwidth_bps` only when `wifi_graph()` shows the winner and loser
+are also in WiFi range of each other. `advance_merge_sync()` is called once
+per tick in the control loop; `completed_merges`/`election.pending_merges`
+are reported in the live `[status]` line and the final summary.
+
+**Known, named gap**: two masters can be in Tomoto/LoRa range (enough to
+agree on a merge winner via the election itself) while still outside WiFi
+range (can't yet exchange the bulk `D_merged` payload) — there is no
+explicit "winner decided, database sync pending" intermediate state beyond
+what `MergeState`/`pending_merges` already represent; and the reachability
+check for an in-progress merge checks WiFi presence but not whether the
+LoRa link between winner and loser specifically (vs. just being in the same
+reconnected cluster) is actually still up — a real but unresolved finding
+from the most recent review pass.
+
+### 16.10 Fault injection (CLI)
+
+| Flag | Effect |
+|---|---|
+| `--crash HW_ID` | Excludes that hw_id from the run entirely (never connects, never flies) — models a drone that was never airborne, not a mid-flight failure. |
+| `--byzantine HW_ID:ON:OE` | That drone self-reports its position offset by `(ON, OE)` meters — exercises the eligibility vote's spoofing detection (§16.5). |
+| `--isolate HW_ID:T0:T1` | Severs every comm edge to/from that drone for sim-time window `[T0, T1)` — repeatable per hw_id (a dict-comprehension bug silently dropped all but the last window per hw_id for a repeated flag; fixed to store a list of windows). The isolated drone stays a genuine singleton participant (own election, goal-seeking-only flocking) rather than being deleted from the graph, which is what lets it diverge to its own master and produce a real merge event on reconnection. |
+| `--compute-capacity HW_ID:VALUE` | Overrides a specific drone's `L_i` input for testing, since the live default (`compute_capacity_from_load()`, real `os.getloadavg()`-based) can't yet differentiate between drones running in one shared process (§16.14). |
+| `--obstacle N:E:RADIUS` | Adds a known static obstacle at local NED `(N, E)` with the given radius (§16.7); repeatable. |
+
+### 16.11 CLI reference
+
+```
+python3 realtime_swarm_dynamic.py \
+  --config drones_config.json \
+  --port-base 50040 \
+  --comm-range-lora 30 [--comm-range-wifi 0] \
+  [--lora-broadcast-interval 0] [--no-neighbor-decay] \
+  [--isolation-rth-timeout 6.0] \
+  --goal-n 20 --goal-e 0 \
+  --takeoff-alt 10 --control-rate 20 --duration 25 \
+  [--land-on-exit] [--dry-run] \
+  [--crash HW_ID] [--byzantine HW_ID:ON:OE] [--isolate HW_ID:T0:T1] \
+  [--compute-capacity HW_ID:VALUE] [--obstacle N:E:RADIUS] \
+  --output-dir out_dir
+```
+
+`--config` reuses the same `drones_config.json` as Option B/C (§4.1) — the
+`is_leader` field is simply ignored, since Option D has no fixed leader.
+Omitting `--duration` runs until Ctrl-C. `--dry-run` connects and computes
+everything but never arms/takes off/sends offboard setpoints, same
+semantics as Option B's `--dry-run` (§7.3).
+
+### 16.12 Validated results (real PX4 SITL + Gazebo, not just unit tests)
+
+Every mechanism above has been exercised against live PX4, not only the
+unit tests in §16.13:
+
+- **Single-vehicle Gazebo** (`phase1_gazebo_single_vehicle.py`): full
+  arm→takeoff→offboard→land lifecycle, a 6s setpoint-stream lapse (PX4
+  stayed in OFFBOARD the whole time — a paused application loop with the
+  connection otherwise alive behaves differently from a genuinely dead
+  link), and (`phase1_offboard_loss_followup.py`) a real `mavsdk_server`
+  process kill mid-flight — confirmed via the PX4 `.ulg` flight log, not
+  just a live telemetry read (which gave a contradictory, misleading
+  snapshot right after reconnecting) — that PX4's own offboard-loss
+  failsafe lands the vehicle smoothly and disarms, with zero visibility to
+  the companion side.
+- **Obstacle avoidance** (`gz_worlds/obstacle_test.sdf`): a real 2m-radius,
+  20m-tall cylinder in the flight path. Without `--obstacle`: straight-line
+  collision, altitude went erratic/negative. With the same position given
+  via `--obstacle`: clean deflection, closest approach 5.97m to the
+  obstacle center, stable altitude throughout.
+- **Multi-vehicle Gazebo** (`gz_worlds/multi_x500_static.sdf`, 3 drones):
+  getting real multi-vehicle Gazebo working at all required a
+  statically-authored world (PX4's dynamic `-i N` model-spawn mechanism has
+  a real Gazebo sensor-attachment race — only 1 of 3 dynamically-spawned
+  instances ever got real sensor data). Once fixed, a full 3-drone flight
+  showed organic (no injected fault) periodic re-election as scores
+  drifted, a brief real partition, and an automatic merge back to one
+  master — live election/partition/merge dynamics in real physics, not
+  simulated in the abstract 2D model.
+- **Headless multi-drone SITL fault injection**: `--isolate` + merge +
+  `--lora-broadcast-interval` exercised together in one real armed flight;
+  a separate `--crash` test confirming re-election among survivors
+  (hysteresis correctly gating the switch, not instant).
+
+### 16.13 Tests
+
+`tests/` — 28 assertions across 6 files, plain `python3 tests/test_X.py`
+scripts (not pytest-style), runnable with no SITL/Gazebo at all since
+`swarm_election.py` has no MAVSDK dependency:
+
+| File | Covers |
+|---|---|
+| `test_swarm_election.py` | Core election/hysteresis, LoRa-primary/WiFi-optional comm graphs |
+| `test_phase2_phase3_gaps.py` | Merge reconciliation, the ranging-sensor hook (fails loudly without real hardware) |
+| `test_phase5_decay.py` | Neighbor-influence decay (ramp vs. hard-cutoff, reconnection recovery) |
+| `test_phase5_tiers_rth.py` | Degradation tiers, isolation → degraded_mode → RTH |
+| `test_rth_eligibility.py` | RTH'd drones excluded from election candidacy |
+| `test_compute_capacity.py` | `L_i`/`compute_capacity_from_load()` actually affects the score and election outcome |
+
+Run all of them: `tests/run_all.sh`. A later automated review (Sourcery)
+found 4 of these assertions were weaker than their own stated intent (e.g.
+a "force with a stale neighbor" computed but never actually checked against
+anything) — all 4 fixed, and one of them (`test_phase5_tiers_rth.py`)
+surfaced a genuine engine bug in the process (§16.8's RTH-clearing fix),
+not just a test gap.
+
+### 16.14 Known limitations / open items
+
+- **Still one process** computing every drone's election and flocking —
+  Option D removes the *logical* fixed-leader single point of failure, not
+  the *process* one (§10.4 cross-reference above). A real deployment needs
+  each drone running its own separate companion-PC process.
+- **`compute_capacity_from_load()` is real but shared, not per-drone.** It
+  reads this one process's actual `os.getloadavg()`, inverted/normalized —
+  genuine CPU-load data, but the same number for every drone, since there's
+  only one process. `--compute-capacity HW_ID:VALUE` overrides it for
+  testing until each drone has its own companion PC.
+- **No real ranging sensor.** `measured_distance()`'s `ranging_available`
+  stays `False` on the actual target hardware (Tomoto has none, confirmed)
+  — fails loudly rather than lying to the eligibility gate if flipped
+  without one.
+- **Energy-reserve and connectivity floors are soft, not hard** (§16.4) —
+  needs a policy threshold decision, not more code.
+- **Task reassignment** is a named placeholder (`merge_payload_bytes` has
+  no real payload behind it yet) — blocked on a separate, not-yet-built
+  task-allocation feature.
+- **Tomoto's real broadcast rate and duty-cycle budget are
+  uncharacterized** against actual hardware (§16.6) — the companion
+  research project's abstract simulation found a broadcast-interval safety
+  margin (safe through several seconds, failing sharply beyond that) that
+  gives a concrete target to validate real hardware against, but that
+  sweep was run in the separate `swarm_sim_core.py` project, not
+  reproduced against real Tomoto radios here.
+- **No live obstacle sensing** (§16.7) — `--obstacle` positions are known/
+  configured, not derived from lidar/depth-camera data.
+- **Goal-seeking oscillates near a static goal** (§16.7) — no
+  damping/braking term, observed directly in live Gazebo flight.
+- **Merge reachability isn't fully re-checked mid-sync** (§16.9) — a
+  pending merge can advance assuming LoRa connectivity without confirming
+  the specific winner-loser link (not just general cluster membership) is
+  still up.
    window for that drone.
