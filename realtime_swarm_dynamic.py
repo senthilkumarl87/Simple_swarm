@@ -112,9 +112,15 @@ from realtime_swarm_mavsdk import (
     telemetry_logger_task,
     graceful_shutdown,
 )
-from swarm_election import (DroneState, ElectionParams, ElectionState, comm_graph, wifi_graph, clusters,
+from swarm_election import (DroneState, ElectionParams, ElectionState, Obstacle, comm_graph, wifi_graph, clusters,
                              flock_force, update_neighbor_link_state, advance_merge_sync,
                              tier_of, update_isolation_rth)
+
+
+def parse_obstacle(spec: str):
+    """HW_ID-less: an obstacle isn't owned by a drone. Format: N:E:RADIUS."""
+    n_s, e_s, r_s = spec.split(":")
+    return Obstacle(pos=np.array([float(n_s), float(e_s)]), radius=float(r_s))
 
 
 # ------------------------------------------------------------- fault injection --
@@ -317,7 +323,7 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
             # against) -- a more realistic degraded-but-still-autonomous behavior
             # than halting in place, and the one that lets it genuinely diverge
             # toward its own election outcome.
-            force = flock_force(i, live_states, adj, params)
+            force = flock_force(i, live_states, adj, params, obstacles=args.obstacle)
             s = states[i]
             new_vel = s.vel + force * period
             speed = float(np.linalg.norm(new_vel))
@@ -517,6 +523,10 @@ def main():
                     help="override L_i (0..1) for this drone, after the shared real-CPU-load read -- lets the "
                          "suitability score's sensitivity to L_i be tested even though the live default can't "
                          "yet differentiate between drones (see compute_capacity_from_load()'s docstring)")
+    p.add_argument("--obstacle", type=parse_obstacle, action="append", default=[], metavar="N:E:RADIUS",
+                    help="a KNOWN static obstacle at local NED (N,E) with the given radius (m) -- F_obstacle, "
+                         "repeatable. Known positions, not live onboard sensing (none is wired up yet; see "
+                         "obstacle_force()'s docstring in swarm_election.py)")
     args = p.parse_args()
 
     try:

@@ -15,6 +15,13 @@ carries over:
   - _run_election       -> run_election (same hysteresis branch structure)
   - _flock_force        -> flock_force (same repulsion/cohesion/alignment/goal terms)
 
+F_obstacle (Appendix C Phase 4) has NO swarm_sim_core.py precedent to port --
+that reference implementation never had it either (named in the original
+architecture brief, never implemented there, see CLAUDE.md's working-convention
+log). obstacle_force() is new here, same force-law shape as inter-agent
+repulsion. See its docstring for the known-vs-sensed obstacle-position gap,
+structurally identical to measured_distance()'s ranging gap.
+
 KNOWN GAP (see UAV_Swarm_Update_Claude_Code_Spec.md, Appendix C, Phase 2): the
 eligibility gate's d_AB is supposed to come from an independent ranging sensor
 (UWB, etc.), not from the same GPS stream as the self-report. No such sensor is
@@ -100,6 +107,15 @@ class ElectionParams:
     alignment_gain: float = 0.6
     max_accel: float = 3.0
     max_speed: float = 4.0
+
+    # F_obstacle (Appendix C Phase 4 gap, named since the original architecture
+    # brief comparison and never implemented until now). Same force-law shape as
+    # inter-agent repulsion, kept as separate parameters rather than reusing
+    # D_safe/D_rep/repulsion_gain because a real obstacle (wall, pole, tree) may
+    # warrant a different safety margin than inter-agent separation -- no reason
+    # to assume they should match. See obstacle_force() below.
+    obstacle_safe_dist: float = 8.0    # m, distance to obstacle SURFACE at which repulsion begins
+    obstacle_gain: float = 6.0
 
 
 @dataclass
@@ -500,7 +516,45 @@ class ElectionState:
 
 # -------------------------------------------------------------- flocking ----
 
-def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParams) -> np.ndarray:
+@dataclass
+class Obstacle:
+    """A static obstacle (wall, pole, tree) in the horizontal plane -- treated as
+    circular/cylindrical for the force law, which is the common simplification
+    for a repulsion-style avoidance term and adequate for anything from a pole
+    to a building corner at the distances D_safe-scale forces operate over."""
+    pos: np.ndarray    # [n, e], m -- center
+    radius: float = 0.0   # m, 0 for a point obstacle
+
+
+def obstacle_force(hw_id: int, states: dict[int, DroneState], obstacles, p: ElectionParams) -> np.ndarray:
+    """F_obstacle -- the term named in the original architecture brief
+    (UAV_Swarm_Control_Update_Dynamic_Master_Three_Force.docx) and missing from
+    this reference implementation ever since (Appendix C Phase 4). Same
+    force-law shape as inter-agent repulsion (flock_force's f_rep), scaled by
+    obstacle_safe_dist/obstacle_gain rather than D_rep/repulsion_gain, since a
+    real obstacle may warrant a different safety margin than inter-agent
+    separation.
+
+    SENSING GAP, same shape as measured_distance()'s for the eligibility gate:
+    `obstacles` is a list of KNOWN static obstacle positions/radii, not live
+    onboard sensor data (lidar/depth camera) -- no such sensing is wired up
+    yet. This closes the missing CONTROL LAW; swapping known positions for
+    live onboard-sensor-derived ones is a separate, future integration step."""
+    a = states[hw_id]
+    f_obs = np.zeros(2)
+    for obs in obstacles:
+        raw_d = float(np.linalg.norm(a.pos - obs.pos))
+        d = raw_d - obs.radius   # distance to the obstacle SURFACE, not its center
+        if d < p.obstacle_safe_dist:
+            d_eff = max(d, 0.5)
+            strength = p.obstacle_gain * (p.obstacle_safe_dist - d) / d_eff
+            direction = (a.pos - obs.pos) / max(raw_d, 1e-6)
+            f_obs += strength * direction
+    return f_obs
+
+
+def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParams,
+                 obstacles=()) -> np.ndarray:
     """swarm_sim_core.py::_flock_force -- repulsion, cohesion, distance-dependent
     alignment, plus goal-seeking, over the union of currently-reachable AND
     recently-stale-but-still-decaying neighbors (Appendix C Phase 5, proposal
@@ -563,6 +617,8 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
     dist_goal = float(np.linalg.norm(to_goal))
     f_goal = (to_goal / dist_goal) if dist_goal > 1e-6 else np.zeros(2)
 
+    f_obs = obstacle_force(hw_id, states, obstacles, p)
+
     if a.degraded_mode:
         # Sensor-only degraded mode (Section 7.3): drop cohesion and alignment
         # toward a swarm this drone cannot currently communicate with -- keep
@@ -572,9 +628,11 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
         # recently-decaying neighbors survive total isolation long), but
         # mirrors swarm_sim_core.py's explicit branch rather than relying on
         # that coincidence, matching the proposal's framing exactly.
-        total = f_goal + f_rep
+        # F_obstacle stays active here too -- it is exactly as safety-critical
+        # as inter-agent repulsion and has no dependency on swarm comms at all.
+        total = f_goal + f_rep + f_obs
     else:
-        total = f_goal + f_rep + p.alignment_gain * f_align + f_coh
+        total = f_goal + f_rep + p.alignment_gain * f_align + f_coh + f_obs
 
     mag = float(np.linalg.norm(total))
     if mag > p.max_accel:
