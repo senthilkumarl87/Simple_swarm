@@ -15,31 +15,44 @@ just driven by real vehicle telemetry/dynamics instead of simulated physics. See
 UAV_Swarm_Update_Claude_Code_Spec.md, Appendix C, Phase 3/4 for where this sits on
 the hardware-implementation roadmap.
 
-SCOPE OF THIS FIRST PASS (not yet done -- see Appendix C Phase 5):
-  - No real inter-UAV comm layer; comm_graph is computed centrally from real GPS
-    positions against --comm-range-lora, not from an actual radio/mesh link budget.
-  - No independent ranging sensor behind the eligibility gate's d_AB -- see the
-    docstring in swarm_election.py for exactly what this does and doesn't defend
-    against as a result.
-  - No neighbor-influence decay / link-failure-timeout state machine (Sec. 6);
-    a neighbor silently drops out of the flocking force the instant it leaves
-    --comm-range-lora, rather than decaying over NEIGHBOR_INFLUENCE_DECAY_WINDOW.
-  - No automatic RTH on isolation timeout.
-  - Merge reconciliation on partition rejoin is implicit (the tie-break chain
-    naturally promotes the single highest-scoring eligible candidate across the
-    merged cluster) rather than the explicit step-by-step procedure in the
-    proposal's Section 7.1 algobox -- see the comment in
-    swarm_election.ElectionState.run_election.
+SCOPE OF THIS PASS:
+  - Real inter-UAV comm layer is still not here; comm_graph is computed centrally
+    from real GPS positions against --comm-range-lora, not from an actual Tomoto
+    radio/mesh link budget -- that still needs real hardware (Phase 2's
+    duty-cycle/airtime characterization is physically unmeasurable without it).
+    What IS now modeled: Tomoto's real broadcast RATE, via --lora-broadcast-interval
+    (0 = disabled/continuous, matching every earlier run of this script; > 0 makes
+    flock_force() use throttled, possibly-stale received neighbor state instead of
+    live telemetry -- see swarm_election.update_neighbor_reception()).
+  - No independent ranging sensor behind the eligibility gate's d_AB -- structurally
+    explicit now via swarm_election.measured_distance() (p.ranging_available stays
+    False on the target hardware; flipping it without a real sensor behind it raises
+    rather than silently lying to the gate).
+  - No neighbor-influence decay / link-failure-timeout state machine (Sec. 6) --
+    still Phase 5 scope, intentionally not pulled forward here; a neighbor silently
+    drops out of the flocking force the instant it leaves --comm-range-lora.
+  - No automatic RTH on isolation timeout -- still Phase 5 scope.
+  - Merge reconciliation on partition rejoin is now EXPLICIT: reconnecting two
+    formerly-separate clusters creates a swarm_election.MergeState (winner decided
+    immediately via the tie-break chain; a bulk D_merged payload then has to
+    actually finish transferring -- chunked over LoRa's low bandwidth by default,
+    sped up opportunistically over WiFi when in range, matching the LoRa-primary
+    design rule) rather than treating the election outcome alone as "merged." See
+    --merge-payload-bytes / --lora-bandwidth-bps / --wifi-bandwidth-bps.
 
 FAULT INJECTION (for exercising the scenarios in the proposal's Section 9.3):
   --crash HW_ID              never connect/arm this drone -- simulates scenario 2
   --byzantine HW_ID:ON:OE    apply a constant self-report offset (m) to this
                               drone's position for the eligibility gate only --
                               simulates scenario 3 (spoofed position)
-  --isolate HW_ID:T0:T1      exclude this drone from the comm graph during
-                              [T0, T1) seconds of wall-clock run time -- simulates
-                              scenario 8 (temporary isolation) / contributes to
-                              scenario 6/7 (forced partition) when applied to a
+  --isolate HW_ID:T0:T1      sever every comm-graph edge to/from this drone during
+                              [T0, T1) seconds of wall-clock run time -- it remains
+                              a genuine singleton participant (runs its own election,
+                              flocks on goal-seeking alone) rather than being deleted
+                              from the graph, so it can actually diverge to its own
+                              master and trigger a real merge event on reconnection.
+                              Simulates scenario 8 (temporary isolation) / contributes
+                              to scenario 6/7 (forced partition) when applied to a
                               whole side of the swarm
 
 Usage mirrors realtime_swarm_mavsdk.py; see its --help and the README for the
@@ -74,7 +87,8 @@ from realtime_swarm_mavsdk import (
     telemetry_logger_task,
     graceful_shutdown,
 )
-from swarm_election import DroneState, ElectionParams, ElectionState, comm_graph, clusters, flock_force
+from swarm_election import (DroneState, ElectionParams, ElectionState, comm_graph, wifi_graph, clusters,
+                             flock_force, update_neighbor_reception, advance_merge_sync)
 
 
 # ------------------------------------------------------------- fault injection --
@@ -127,7 +141,13 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
     tick = 0
 
     election = ElectionState()
-    params = ElectionParams(comm_range_lora=args.comm_range_lora, comm_range_wifi=args.comm_range_wifi)
+    params = ElectionParams(
+        comm_range_lora=args.comm_range_lora, comm_range_wifi=args.comm_range_wifi,
+        lora_broadcast_interval=args.lora_broadcast_interval,
+        lora_bandwidth_bps=args.lora_bandwidth_bps, wifi_bandwidth_bps=args.wifi_bandwidth_bps,
+        merge_payload_bytes=args.merge_payload_bytes,
+    )
+    completed_merges = 0
 
     isolate_windows = {hw_id: (t0, t1) for hw_id, t0, t1 in args.isolate}
 
@@ -145,10 +165,26 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         if args.duration and t_rel >= args.duration:
             break
 
-        # Comm graph: exclude drones currently inside an --isolate window.
+        # Comm graph: an isolated drone stays a genuine (singleton) participant --
+        # it still runs its own election and flocking, just with every edge to/from
+        # it severed -- rather than being deleted from the graph outright. This
+        # matters for more than realism: a drone removed from the graph entirely
+        # never runs _run_election() at all, so it can never diverge to its own
+        # independently-elected master, which means it can never trigger a genuine
+        # merge event on reconnection either -- the exact mechanism this script
+        # exists to validate. Found by trying to exercise pending_merges with
+        # --isolate and getting zero merges: the old behavior silently prevented
+        # the scenario it was meant to produce.
         isolated_now = {hw_id for hw_id, (t0, t1) in isolate_windows.items() if t0 <= t_rel < t1}
-        live_states = {i: s for i, s in states.items() if i not in isolated_now}
+        live_states = states
         adj = comm_graph(live_states, params.comm_range_lora)    # PRIMARY link only -- see swarm_election.py docstring
+        for hw_id in isolated_now:
+            severed = adj.pop(hw_id, set())
+            for other in severed:
+                adj.get(other, set()).discard(hw_id)
+            adj[hw_id] = set()   # still its own singleton cluster, just with no edges
+        update_neighbor_reception(live_states, adj, params, t_rel)   # no-op unless --lora-broadcast-interval > 0
+        wifi_adj = wifi_graph(live_states, params.comm_range_wifi)   # empty unless --comm-range-wifi > 0 and in range
 
         for cluster_ids in clusters(adj):
             master = election.run_election(cluster_ids, live_states, adj, params, t_rel, "periodic")
@@ -158,9 +194,31 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
                     print(f"[election] t={t_rel:6.1f}s  hw_id {i}: master -> {master}")
                     last_master_print[i] = master
 
+        # Advance any merges still waiting on their bulk D_merged sync (explicit
+        # "winner decided, sync pending" state -- Appendix C Phase 2 / proposal
+        # Section 7.1). WiFi speeds this up opportunistically when the winner and
+        # loser happen to also be in wifi_graph range of each other; otherwise it
+        # completes over LoRa alone, just more slowly -- never blocked on WiFi.
+        still_pending = []
+        for m in election.pending_merges:
+            wifi_connected = m.loser in wifi_adj.get(m.winner, set())
+            advance_merge_sync(m, wifi_connected, params, period)
+            if m.sync_complete:
+                completed_merges += 1
+                via = "WiFi" if wifi_connected else "LoRa"
+                print(f"[merge] t={t_rel:6.1f}s  D_merged sync complete: winner={m.winner} "
+                      f"loser={m.loser} (decided t={m.decided_at:.1f}s, synced via {via}, "
+                      f"took {t_rel - m.decided_at:.1f}s)")
+            else:
+                still_pending.append(m)
+        election.pending_merges = still_pending
+
         for i in follower_ids:
-            if i in isolated_now:
-                continue    # isolated drones hold position rather than compute flocking blind
+            # Isolated drones now flow through the normal path: with adj[i] severed
+            # to empty above, flock_force naturally reduces to goal-seeking only
+            # (no neighbors to repel/cohere/align against) -- a more realistic
+            # degraded-but-still-autonomous behavior than halting in place, and the
+            # one that lets it genuinely diverge toward its own election outcome.
             force = flock_force(i, live_states, adj, params)
             s = states[i]
             new_vel = s.vel + force * period
@@ -190,7 +248,8 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
             masters = {i: live_states[i].is_master for i in follower_ids if i in live_states}
             cur = [i for i, m in masters.items() if m]
             print(f"[status] t={t_rel:5.1f}s  master(s)={cur}  "
-                  f"isolated={sorted(isolated_now) or '-'}  clusters={len(clusters(adj))}")
+                  f"isolated={sorted(isolated_now) or '-'}  clusters={len(clusters(adj))}  "
+                  f"pending_merges={len(election.pending_merges)}")
 
         tick += 1
         sleep_for = (start_mono + tick * period) - time.monotonic()
@@ -204,7 +263,9 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         for t, cids, old, new, why in election.switch_log:
             f.write(f"{t:.2f},\"{cids}\",{old},{new},{why}\n")
     print(f"[ctrl] control loop done -- {tick} ticks, "
-          f"{len(election.switch_log)} master-switch events "
+          f"{len(election.switch_log)} master-switch events, "
+          f"{completed_merges} merge(s) fully synced, "
+          f"{len(election.pending_merges)} merge(s) still pending at shutdown "
           f"(log: {args.output_dir / 'master_switch_events.csv'})")
 
 
@@ -302,8 +363,25 @@ def main():
     p.add_argument("--comm-range-lora", type=float, default=30.0,
                     help="m, PRIMARY (LoRa) link range -- election/eligibility/flocking all key to this")
     p.add_argument("--comm-range-wifi", type=float, default=0.0,
-                    help="m, OPTIONAL accelerant link range; 0 = absent (default). Not yet wired into any "
-                         "function -- reserved for a future opportunistic bulk-transfer speedup.")
+                    help="m, OPTIONAL accelerant link range; 0 = absent (default). Used only to speed up a "
+                         "pending merge's D_merged sync opportunistically -- never required for correctness.")
+    p.add_argument("--lora-broadcast-interval", type=float, default=0.0,
+                    help="s, how often a drone actually RECEIVES a given neighbor's broadcast state over Tomoto; "
+                         "0 = disabled (default), matching every earlier run of this script with continuous live "
+                         "telemetry. > 0 makes flock_force use throttled, possibly-stale state instead -- see the "
+                         "companion proposal's Section 10.4 for the empirical safety threshold this should be "
+                         "checked against once Tomoto's real achievable rate is measured.")
+    p.add_argument("--lora-bandwidth-bps", type=float, default=1000.0,
+                    help="bits/s, placeholder Tomoto throughput used to pace a pending merge's D_merged transfer "
+                         "when WiFi isn't available. Replace with a measured value once Tomoto's real throughput "
+                         "is characterized (Appendix C, Phase 2).")
+    p.add_argument("--wifi-bandwidth-bps", type=float, default=1_000_000.0,
+                    help="bits/s, placeholder WiFi throughput used to pace a pending merge's D_merged transfer "
+                         "when the winner and loser are also in --comm-range-wifi of each other.")
+    p.add_argument("--merge-payload-bytes", type=float, default=2048.0,
+                    help="placeholder D_merged (coverage/task database) size in bytes -- the real task-allocation "
+                         "feature that would define this isn't built yet; this lets the merge sync TIMING "
+                         "mechanism be exercised now without waiting on that unrelated feature.")
     p.add_argument("--goal-n", type=float, default=20.0, help="m, shared goal offset (north) from each drone's own start position")
     p.add_argument("--goal-e", type=float, default=0.0, help="m, shared goal offset (east) from each drone's own start position")
     p.add_argument("--takeoff-alt", type=float, default=10.0)
@@ -318,7 +396,9 @@ def main():
     p.add_argument("--byzantine", type=parse_byzantine, action="append", default=[], metavar="HW_ID:ON:OE",
                     help="self-report offset in meters, eligibility gate only (scenario 3: spoofed position)")
     p.add_argument("--isolate", type=parse_isolate, action="append", default=[], metavar="HW_ID:T0:T1",
-                    help="exclude from comm graph during [T0,T1) seconds (scenario 8: temporary isolation)")
+                    help="sever every comm-graph edge to/from this drone during [T0,T1) seconds -- it stays a "
+                         "genuine singleton participant, not removed from the graph (scenario 8: temporary "
+                         "isolation; reconnection afterward can trigger a real merge event)")
     args = p.parse_args()
 
     try:
