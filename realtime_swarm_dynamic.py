@@ -85,6 +85,7 @@ general SITL setup (mavsdk_server per drone, start_multi_px4.sh).
 
 import argparse
 import asyncio
+import csv
 import os
 import signal
 import sys
@@ -185,17 +186,22 @@ async def drone_state_tracker(hw_id: int, drone: System, state: DroneState, upda
                 # never actually exercised in the earlier SITL dynamic-election runs.
                 state.energy = float(np.clip(b.remaining_percent / 100.0, 0.0, 1.0))
         except Exception:
-            pass    # SITL battery plugin not always present -- keep default 1.0
+            # SITL battery plugin not always present. DroneState.energy's dataclass
+            # default is 1.0 (fully charged) -- silently keeping that here would let
+            # an unknown-battery drone look MORE attractive to the election than one
+            # with a known, lower reading, which is the wrong direction for a
+            # safety-relevant score. Conservative fallback instead (found via
+            # Sourcery review).
+            state.energy = 0.5
 
     await asyncio.gather(pos_vel(), battery())
 
 
 # ------------------------------------------------------------ main control loop -
 
-async def control_loop(args, drones: dict, states: dict, logs: dict, stop: asyncio.Event):
+async def control_loop(args, drones: dict, states: dict, logs: dict, stop: asyncio.Event, start_mono: float):
     follower_ids = sorted(drones.keys())
     period = 1.0 / args.control_rate
-    start_mono = time.monotonic()
     tick = 0
 
     election = ElectionState()
@@ -210,9 +216,16 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         ISOLATION_RTH_TIMEOUT=args.isolation_rth_timeout,
     )
     completed_merges = 0
-    rth_triggered: set[int] = set()   # hw_ids we've already fired return_to_launch() for
+    rth_triggered: set[int] = set()   # hw_ids whose return_to_launch() was ACCEPTED (not just attempted)
+    rth_last_attempt: dict[int, float] = {}   # hw_id -> t_rel of the last attempt, success or failure
+    RTH_RETRY_COOLDOWN_S = 5.0   # don't hammer return_to_launch() every tick while retrying a failure
 
-    isolate_windows = {hw_id: (t0, t1) for hw_id, t0, t1 in args.isolate}
+    # A list of windows per hw_id, not a dict keyed by hw_id -- a dict comprehension
+    # here would silently keep only the LAST --isolate for a repeated hw_id, dropping
+    # any earlier ones requested on the command line (found via Sourcery review).
+    isolate_windows: dict[int, list[tuple[float, float]]] = {}
+    for hw_id, t0, t1 in args.isolate:
+        isolate_windows.setdefault(hw_id, []).append((t0, t1))
     compute_capacity_overrides = dict(args.compute_capacity)
 
     cmd_logs = {fid: [] for fid in follower_ids}
@@ -239,7 +252,8 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         # exists to validate. Found by trying to exercise pending_merges with
         # --isolate and getting zero merges: the old behavior silently prevented
         # the scenario it was meant to produce.
-        isolated_now = {hw_id for hw_id, (t0, t1) in isolate_windows.items() if t0 <= t_rel < t1}
+        isolated_now = {hw_id for hw_id, windows in isolate_windows.items()
+                        if any(t0 <= t_rel < t1 for t0, t1 in windows)}
         live_states = states
 
         # L_i source: real (shared-process) CPU load by default, --compute-capacity
@@ -259,23 +273,29 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         update_isolation_rth(live_states, adj, params, t_rel)         # degraded_mode + rth trigger, Phase 5
         wifi_adj = wifi_graph(live_states, params.comm_range_wifi)   # empty unless --comm-range-wifi > 0 and in range
 
-        # RTH is a real, consequential MAVSDK action -- fire it exactly once per
-        # drone, on the False->True transition only, not every tick it stays
-        # True (which would spam return_to_launch() calls at the control rate).
-        # Fire-and-forget: a failed RTL call shouldn't block the control loop,
-        # but it IS reported, not silently swallowed.
+        # RTH is a real, consequential MAVSDK action. rth_triggered means "RTL
+        # actually ACCEPTED" -- the control loop below only stops sending this
+        # drone setpoints once that's true, not merely attempted. A failed call
+        # used to still mark rth_triggered before the async call resolved, so a
+        # rejected/timed-out RTL permanently stranded the drone: no more setpoints
+        # AND no retry, ever (found via Sourcery review). Fixed: only mark
+        # success; on failure, retry on a cooldown rather than once-and-done, and
+        # keep the drone under normal control in the meantime.
         for hw_id, s in live_states.items():
-            if s.rth and hw_id not in rth_triggered and hw_id in drones and not args.dry_run:
-                rth_triggered.add(hw_id)
+            if (s.rth and hw_id not in rth_triggered and hw_id in drones and not args.dry_run
+                    and t_rel - rth_last_attempt.get(hw_id, -1e9) > RTH_RETRY_COOLDOWN_S):
+                rth_last_attempt[hw_id] = t_rel
                 print(f"[rth] t={t_rel:6.1f}s  hw_id {hw_id}: isolated longer than "
                       f"{params.ISOLATION_RTH_TIMEOUT}s -- calling return_to_launch()")
 
                 async def _do_rth(hw_id=hw_id):
                     try:
                         await drones[hw_id].action.return_to_launch()
+                        rth_triggered.add(hw_id)
                         print(f"[rth] hw_id {hw_id}: return_to_launch() accepted")
                     except Exception as e:
-                        print(f"[rth] hw_id {hw_id}: return_to_launch() FAILED: {e}")
+                        print(f"[rth] hw_id {hw_id}: return_to_launch() FAILED: {e} "
+                              f"-- will retry in up to {RTH_RETRY_COOLDOWN_S:.0f}s if still isolated")
 
                 asyncio.create_task(_do_rth())
 
@@ -364,10 +384,15 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for fid, rows in cmd_logs.items():
         pd.DataFrame(rows).to_csv(args.output_dir / f"drone_{fid}_commanded.csv", index=False)
-    with (args.output_dir / "master_switch_events.csv").open("w") as f:
-        f.write("t,cluster,old_master,new_master,reason\n")
+    with (args.output_dir / "master_switch_events.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["t", "cluster", "old_master", "new_master", "reason"])
         for t, cids, old, new, why in election.switch_log:
-            f.write(f"{t:.2f},\"{cids}\",{old},{new},{why}\n")
+            # old is a tuple (former_masters) for merge events, not a scalar hw_id --
+            # writing it unquoted via an f-string embeds a raw ", " in the field,
+            # producing extra columns a naive CSV reader would misparse (found via
+            # Sourcery review; csv.writer quotes it as one field automatically).
+            writer.writerow([f"{t:.2f}", cids, old, new, why])
     print(f"[ctrl] control loop done -- {tick} ticks, "
           f"{len(election.switch_log)} master-switch events, "
           f"{completed_merges} merge(s) fully synced, "
@@ -401,11 +426,20 @@ async def run(args):
 
     # Seed state from each drone's current position before the control loop starts,
     # so goals (start + offset) are anchored correctly and the first tick isn't blind.
+    # Bounded with a timeout: this used to wait on the telemetry stream forever if
+    # a drone's position_velocity_ned() never yielded a sample, meaning `run()`
+    # never reached the control loop OR its cleanup block for ANY drone, including
+    # ones already armed/airborne from the gather() above (found via Sourcery
+    # review).
     states: dict[int, DroneState] = {}
     for hw_id, d in drones.items():
-        pvn = None
-        async for p in d.telemetry.position_velocity_ned():
-            pvn = p; break
+        async def _first_sample():
+            async for p in d.telemetry.position_velocity_ned():
+                return p
+        try:
+            pvn = await asyncio.wait_for(_first_sample(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"hw_id {hw_id}: no position_velocity_ned sample within 10s")
         n0, e0 = (pvn.position.north_m, pvn.position.east_m) if pvn else (0.0, 0.0)
         states[hw_id] = DroneState(
             hw_id=hw_id,
@@ -425,6 +459,14 @@ async def run(args):
         for hw_id, d in drones.items()
     ]
 
+    # One shared time origin for every drone's telemetry log AND the control loop's
+    # own t_rel -- telemetry_logger_task stamps rows with raw time.monotonic(), which
+    # is directly comparable across drones already; re-zeroing each drone's CSV to
+    # its OWN first sample (as this used to do) breaks that, since drones don't all
+    # receive their first sample at the same instant -- "row i" from two drones'
+    # CSVs would then refer to different real moments (found via Sourcery review).
+    start_mono = time.monotonic()
+
     stop = asyncio.Event()
     tel_logs = {hw_id: [] for hw_id in drones}
     tel_tasks = [
@@ -437,7 +479,7 @@ async def run(args):
         loop.add_signal_handler(sig, lambda: stop.set())
 
     try:
-        await control_loop(args, drones, states, tel_logs, stop)
+        await control_loop(args, drones, states, tel_logs, stop, start_mono)
     finally:
         stop.set()
         for t in tracker_tasks + tel_tasks:
@@ -449,7 +491,7 @@ async def run(args):
         if not rows:
             continue
         df = pd.DataFrame(rows)
-        df["t"] = df["t"] - rows[0]["t"]
+        df["t"] = df["t"] - start_mono
         df["yaw"] = np.radians(df["yaw_deg"])
         df.drop(columns=["yaw_deg"], inplace=True)
         df.insert(0, "idx", np.arange(len(df), dtype=int))

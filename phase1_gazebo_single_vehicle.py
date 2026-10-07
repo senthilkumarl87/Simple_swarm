@@ -107,25 +107,32 @@ async def main():
 
     await wait_ekf_ready(drone)
 
+    already_airborne = False
     async for in_air in drone.telemetry.in_air():
-        if in_air:
-            print("[phase1] already in air, skipping takeoff")
+        already_airborne = in_air
         break
 
-    await arm_with_retries(drone)
-    await drone.action.set_takeoff_altitude(5.0)
-    await drone.action.takeoff()
-    print("[phase1] takeoff commanded, waiting to reach altitude...")
-    for _ in range(60):
-        pvn = None
-        async for p in drone.telemetry.position_velocity_ned():
-            pvn = p
-            break
-        alt = -pvn.position.down_m
-        if alt > 4.0:
-            print(f"[phase1] reached altitude {alt:.2f}m")
-            break
-        await asyncio.sleep(0.5)
+    if already_airborne:
+        # The print used to say "skipping takeoff" but the code fell through to
+        # arm_with_retries() + takeoff() anyway -- rerunning this script against
+        # an already-airborne vehicle could then fail on re-arming or issue a
+        # second takeoff command (found via Sourcery review).
+        print("[phase1] already in air, skipping takeoff")
+    else:
+        await arm_with_retries(drone)
+        await drone.action.set_takeoff_altitude(5.0)
+        await drone.action.takeoff()
+        print("[phase1] takeoff commanded, waiting to reach altitude...")
+        for _ in range(60):
+            pvn = None
+            async for p in drone.telemetry.position_velocity_ned():
+                pvn = p
+                break
+            alt = -pvn.position.down_m
+            if alt > 4.0:
+                print(f"[phase1] reached altitude {alt:.2f}m")
+                break
+            await asyncio.sleep(0.5)
 
     # --- 1. telemetry readback ---
     print("\n=== 1. TELEMETRY READBACK ===")

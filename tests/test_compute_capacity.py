@@ -1,4 +1,5 @@
 import sys, os, numpy as np
+from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from swarm_election import DroneState, ElectionParams, ElectionState, comm_graph, suitability_score, eligibility_vote
 from realtime_swarm_dynamic import compute_capacity_from_load
@@ -27,5 +28,24 @@ print(f"test2 (election winner follows L_i when it's the only differentiator) OK
 cap = compute_capacity_from_load()
 assert 0.0 <= cap <= 1.0
 print(f"test3 (real CPU-load-based capacity: {cap:.3f}, in valid [0,1] range) OK")
+
+# --- test 4: mock os.getloadavg() so this actually proves the function READS load,
+# not just that its real-machine output happens to land in [0,1] -- a hardcoded
+# `return 1.0` regression would still pass test 3 above (found via Sourcery review) ---
+with patch("realtime_swarm_dynamic.os.getloadavg", return_value=(0.0, 0.0, 0.0)), \
+     patch("realtime_swarm_dynamic.os.cpu_count", return_value=4):
+    cap_idle = compute_capacity_from_load()
+assert cap_idle == 1.0, f"expected 1.0 capacity at zero load, got {cap_idle}"
+
+with patch("realtime_swarm_dynamic.os.getloadavg", return_value=(6.4, 0.0, 0.0)), \
+     patch("realtime_swarm_dynamic.os.cpu_count", return_value=4):
+    cap_loaded = compute_capacity_from_load()
+assert abs(cap_loaded - 0.0) < 1e-9, f"expected 0.0 capacity at load == fully_loaded_at, got {cap_loaded}"
+
+with patch("realtime_swarm_dynamic.os.getloadavg", return_value=(3.2, 0.0, 0.0)), \
+     patch("realtime_swarm_dynamic.os.cpu_count", return_value=4):
+    cap_half = compute_capacity_from_load()
+assert abs(cap_half - 0.5) < 1e-9, f"expected 0.5 capacity at half of fully_loaded_at, got {cap_half}"
+print(f"test4 (mocked load -> derived capacity: idle={cap_idle}, half={cap_half}, loaded={cap_loaded}) OK")
 
 print("\nALL COMPUTE_CAPACITY TESTS PASSED")

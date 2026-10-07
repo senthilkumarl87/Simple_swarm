@@ -11,6 +11,13 @@
 # the last-attached instance specifically, a long (~15-20s) gap did not.
 set -eu
 N="${1:-3}"
+# multi_x500_static.sdf only declares x500_0..x500_2 -- a higher N would silently
+# target models that don't exist and fail to attach (found via Sourcery review).
+if [ "$N" -gt 3 ]; then
+  echo "error: this world only declares 3 models (x500_0..x500_2); got N=$N." >&2
+  echo "add more <include> blocks to multi_x500_static.sdf before raising N." >&2
+  exit 1
+fi
 WORLD="multi_x500_static"
 PX4_BIN="$HOME/PX4-Autopilot/build/px4_sitl_default/bin/px4"
 LOG_DIR="/tmp/sitl_run/logs"

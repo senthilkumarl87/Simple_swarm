@@ -259,9 +259,9 @@ async def arm_and_offboard_takeoff(hw_id: int, drone: System, alt: float):
     except Exception:
         pass    # not supported on all vehicles; harmless to skip
 
-    # Skip if already airborne (e.g. re-running the controller mid-flight).
-    # Cross-check against `armed` too, not just `in_air()` alone: a fresh
-    # System() connection's first in_air() read can be stale/wrong (found by
+    # Skip (most of) takeoff if already airborne (e.g. re-running the controller
+    # mid-flight). Cross-check against `armed` too, not just `in_air()` alone: a
+    # fresh System() connection's first in_air() read can be stale/wrong (found by
     # hitting this directly -- a vehicle that was actually disarmed on the
     # ground read in_air=True once right after reconnecting, got skipped here,
     # and then sat motionless for the whole run while the others flew).
@@ -269,15 +269,35 @@ async def arm_and_offboard_takeoff(hw_id: int, drone: System, alt: float):
         in_air = v; break
     async for v in drone.telemetry.armed():
         armed = v; break
-    if in_air and armed:
-        print(f"[hw_id {hw_id}] already in air")
-        return
 
-    # Snapshot current ground position
+    # Snapshot current ground/current position either way.
     init = None
     async for pvn in drone.telemetry.position_velocity_ned():
         init = pvn; break
     n0, e0 = init.position.north_m, init.position.east_m
+
+    if in_air and armed:
+        # Still need to verify OFFBOARD specifically: an airborne+armed vehicle
+        # reconnected from a previous run could be sitting in HOLD/RTL/POSITION,
+        # and set_position_velocity_ned() alone never requests a mode switch --
+        # only offboard.start() does. Without this check the caller would send
+        # setpoints the vehicle silently ignores, with no error ever surfacing
+        # (found via Sourcery review, not hit live -- every SITL run this
+        # session happened to reconnect into a vehicle already in OFFBOARD).
+        flight_mode = "?"
+        async for fm in drone.telemetry.flight_mode():
+            flight_mode = str(fm); break
+        if "OFFBOARD" in flight_mode:
+            print(f"[hw_id {hw_id}] already in air (OFFBOARD)")
+            return
+        print(f"[hw_id {hw_id}] already in air but mode={flight_mode}, re-entering OFFBOARD")
+        await drone.offboard.set_position_ned(PositionNedYaw(n0, e0, -alt, 0.0))
+        try:
+            await drone.offboard.start()
+        except OffboardError as e:
+            print(f"[hw_id {hw_id}] offboard re-entry FAILED: {e}")
+            raise
+        return
 
     # Seed the offboard setpoint at takeoff altitude (NED: down is negative-up)
     await drone.offboard.set_position_ned(

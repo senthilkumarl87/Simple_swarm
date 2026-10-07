@@ -58,7 +58,12 @@ adj5_back = {1: {2}, 2: {1}}
 update_isolation_rth(states5, adj5_back, p, t=4.0)
 assert states5[1].degraded_mode is False
 assert states5[1].isolated_since == -1.0
-print("test6 (reconnection clears degraded_mode / isolated_since) OK")
+# Previously missing: the test's own name/comment claimed "and rth state" but never
+# actually checked it, so update_isolation_rth() leaving rth=True after reconnection
+# (contradicting its own docstring, "Reconnecting clears both") passed silently
+# (found via Sourcery review). Now fixed in both the engine and this assertion.
+assert states5[1].rth is False, "rth should also clear on reconnection, per this function's own docstring"
+print("test6 (reconnection clears degraded_mode / isolated_since / rth) OK")
 
 # --- test 7: flock_force in degraded_mode drops cohesion+alignment, keeps repulsion+goal ---
 p2 = ElectionParams(comm_range_lora=100.0, D_rep=8.0, cohesion_start=10.0)

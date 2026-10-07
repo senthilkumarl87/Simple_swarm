@@ -25,12 +25,21 @@ assert abs(w1 - 0.5) < 1e-6, f"expected exactly 0.5 at the midpoint of a 2s line
 print(f"test1 (linear decay mid-window: influence={w1}) OK")
 
 # flock_force should still see neighbor 2 (frozen last-known position), not drop it instantly
-adj_empty_for_1 = {1: set(), 2: set()}
-force_with_stale = flock_force(1, states, adj_empty_for_1 if False else adj2, p)
-# neighbor 2 is far away (50m) -- outside cohesion_max, so force should reduce toward pure goal-seeking,
-# but the key assertion is that flock_force doesn't crash/skip the stale neighbor and uses frozen state
+force_with_stale = flock_force(1, states, adj2, p)
 assert 2 in (set(states[1].neighbor_influence.keys()) - adj2.get(1, set())), "neighbor 2 should be in stale_ids"
-print("test2 (stale neighbor held in neighbor_influence, visible to flock_force as stale_ids) OK")
+# The real assertion Sourcery's review found missing: force_with_stale was computed
+# but never actually checked against anything, so flock_force could silently ignore
+# stale neighbors entirely and this test would still pass. Compare against a GENUINELY
+# fresh DroneState with no neighbor bookkeeping at all -- reusing states[1] here would
+# silently carry over its already-populated neighbor_influence/neighbor_last_state
+# from the setup above, making this "goal-only" baseline not actually goal-only
+# (caught by checking the result, not assumed: first attempt at this fix produced two
+# identical forces and looked like a real engine bug until this was traced).
+force_goal_only = flock_force(1, {1: mk(1, 0, 0)}, {1: set()}, p)
+assert not np.allclose(force_with_stale, force_goal_only), (
+    f"stale neighbor made no difference to flock_force: with_stale={force_with_stale}, "
+    f"goal_only={force_goal_only}")
+print(f"test2 (stale neighbor measurably affects flock_force: {force_with_stale} vs goal-only {force_goal_only}) OK")
 
 # --- test 3: past NEIGHBOR_STATE_TIMEOUT, fully excluded ---
 update_neighbor_link_state(states, adj2, p, t=5.0)  # age=5s > NEIGHBOR_STATE_TIMEOUT=4.0

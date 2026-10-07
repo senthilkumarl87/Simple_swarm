@@ -9,8 +9,13 @@ def mk(hw_id, n, e, energy=1.0, rth=False):
 p = ElectionParams(comm_range_lora=30.0)
 
 # --- test 1: an rth=True drone with a clearly dominant score must NOT win the election ---
-states = {1: mk(1, 0, 0, energy=0.3, rth=True),   # much higher energy but leaving
-          2: mk(2, 5, 0, energy=0.6)}
+# energy values were previously backwards here (0.3 for the "dominant" RTH'd drone,
+# 0.6 for the winner) -- drone 2 would have won on score alone even with the RTH
+# filter removed, so this never actually exercised the exclusion (found via Sourcery
+# review). Fixed so drone 1's score is genuinely dominant on every other factor, and
+# only the RTH exclusion is what keeps it from winning.
+states = {1: mk(1, 0, 0, energy=0.9, rth=True),   # much higher energy but leaving
+          2: mk(2, 5, 0, energy=0.3)}
 adj = comm_graph(states, p.comm_range_lora)
 es = ElectionState()
 winner = es.run_election({1, 2}, states, adj, p, t=0.0, reason="initial")

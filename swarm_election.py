@@ -326,6 +326,13 @@ def update_isolation_rth(states: dict[int, DroneState], adj: dict[int, set[int]]
         else:
             a.isolated_since = -1.0
             a.degraded_mode = False
+            # This module's own docstring says reconnecting clears degraded_mode
+            # AND rth, but this line was missing -- a drone that crossed
+            # ISOLATION_RTH_TIMEOUT stayed rth=True forever after reconnecting,
+            # permanently excluded from eligible_ids even once it was no longer
+            # isolated (found via Sourcery review flagging a test that asserted
+            # only 2 of these 3 fields, not that rth was actually cleared).
+            a.rth = False
 
 
 # ------------------------------------------------------------------ election ----
@@ -548,7 +555,16 @@ def obstacle_force(hw_id: int, states: dict[int, DroneState], obstacles, p: Elec
         if d < p.obstacle_safe_dist:
             d_eff = max(d, 0.5)
             strength = p.obstacle_gain * (p.obstacle_safe_dist - d) / d_eff
-            direction = (a.pos - obs.pos) / max(raw_d, 1e-6)
+            if raw_d < 1e-6:
+                # At the obstacle's exact center: (a.pos - obs.pos) has no defined
+                # direction, so dividing by max(raw_d, 1e-6) silently produced a
+                # zero vector -- no escape force at all for a vehicle deep inside
+                # the obstacle (found via Sourcery review). Deterministic
+                # (hw_id-dependent, not random) escape direction instead.
+                angle = np.radians(hw_id * 137.5 % 360)
+                direction = np.array([np.cos(angle), np.sin(angle)])
+            else:
+                direction = (a.pos - obs.pos) / raw_d
             f_obs += strength * direction
     return f_obs
 
@@ -592,9 +608,19 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
                 continue  # no reception yet from this neighbor
             b_pos, b_vel = state
         d = float(np.linalg.norm(a.pos - b_pos))
-        if d < 1e-6:
-            continue
         w = a.neighbor_influence.get(j, 1.0)  # decayed weight, Section 6 case 3
+
+        if d < 1e-6:
+            # Exact (or near-exact) coincidence: (a.pos - b_pos)/d has no defined
+            # direction to repel along, so this used to just skip the neighbor
+            # entirely -- meaning two coincident vehicles got ZERO repulsion from
+            # each other and could stay overlapped indefinitely (found via
+            # Sourcery review). Deterministic (not random, so runs stay
+            # reproducible), pair-dependent escape direction instead: antisymmetric
+            # so the two vehicles push apart rather than the same way.
+            angle = np.radians(hash((min(hw_id, j), max(hw_id, j))) % 360) * (1 if hw_id < j else -1)
+            f_rep += w * p.repulsion_gain * np.array([np.cos(angle), np.sin(angle)])
+            continue
 
         if d < p.D_rep:
             strength = p.repulsion_gain * (p.D_rep - d) / max(d, 0.5)
@@ -604,7 +630,11 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
             direction = (b_pos - a.pos) / d
             capped_extent = min(d, p.cohesion_max) - p.cohesion_start
             f_coh += w * capped_extent * direction
-            coh_count += 1
+            # Weight the count by w too, not a flat +1 -- a zero-influence (fully
+            # decayed) stale neighbor contributes nothing to f_coh above but used
+            # to still count toward the divisor, diluting the average pull toward
+            # neighbors that ARE actually contributing (found via Sourcery review).
+            coh_count += w
 
         if d < p.alignment_max_dist:
             align_w = max(0.0, 1 - d / p.alignment_max_dist)
