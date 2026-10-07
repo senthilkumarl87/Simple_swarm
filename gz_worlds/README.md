@@ -76,5 +76,28 @@ already-identified generic load-jitter pre-arm issue (`px4-gazebo-ros2-sim`
 skill, "High Accelerometer Bias"), unrelated to the multi-vehicle bug this
 world was built to fix.
 
-Not yet done: a full multi-drone flight test (election/flocking) against this
-world -- health-status validation only so far.
+**Full multi-drone flight test now done**, not just health-status checks. Getting there surfaced three more real
+bugs in `realtime_swarm_mavsdk.py` (all fixed, see its own commit): `arm()` transiently `COMMAND_DENIED` under
+real CPU contention even after health checks report armable (fixed with a bounded retry); that retry then let
+PX4's offboard setpoint go stale, so `offboard.start()` failed with `NO_SETPOINT_SET` (fixed by refreshing the
+setpoint during the wait); and the "skip if already in air" check trusted a fresh connection's first `in_air()`
+read alone, which can be stale, leaving one drone motionless on the ground for a whole run while the others flew
+(fixed by also requiring `armed`). Separately, one PX4 instance's EKF2 got persistently stuck despite Gazebo
+publishing real sensor data and a sane physics pose -- not root-caused, worked around by restarting just that one
+PX4 process (re-attach via `PX4_GZ_MODEL_NAME`, no Gazebo restart needed).
+
+Example command (3 drones, matching `multi_x500_static.sdf`'s declared positions):
+
+```bash
+python3 realtime_swarm_dynamic.py --config <3-drone config> --port-base 50040 \
+  --comm-range-lora 30 --goal-n 20 --goal-e 0 --duration 25 --control-rate 10 \
+  --takeoff-alt 10 --land-on-exit --output-dir out_multi_gz
+```
+
+Result (2026-10-07): all 3 drones took off, elected hw_id 1, then organically (no injected fault)
+periodic-re-elected to hw_id 3 at t=14.1s as scores shifted, briefly partitioned (hw_id 3 isolated at t=19.9s),
+and merged back to hw_id 1 at t=21.5s -- real election/partition/merge dynamics in live Gazebo physics, not
+fault-injected. One real safety finding, not glossed over: minimum pairwise separation reached 0.66m mid-flight
+(excluding the known co-spawn artifact at t=0), tighter than the obstacle test's 5-6m margins -- plausibly tied to
+the partition event reducing effective repulsion responsiveness. Open item: flocking-parameter tuning under real
+election dynamics specifically, not just static scenarios.
