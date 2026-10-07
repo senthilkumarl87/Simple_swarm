@@ -75,6 +75,21 @@ class ElectionParams:
                                               # this lets the merge TIMING mechanism be built and tested now
                                               # without waiting on that unrelated feature.
 
+    # Neighbor-influence decay (Appendix C Phase 5 / proposal Section 6, case 3:
+    # slave<->slave). Ported from swarm_sim_core.py's already-validated
+    # _update_link_failure_state: a neighbor that drops out of comm_range_lora
+    # holds its last-known state and decays its flocking-force weight linearly
+    # to zero over NEIGHBOR_INFLUENCE_DECAY_WINDOW, rather than vanishing
+    # instantly -- the proposal's own argument (Section 6.3) is that an instant
+    # cutoff introduces a force discontinuity a decay avoids.
+    NEIGHBOR_STATE_TIMEOUT: float = 2.0      # s, full exclusion once a stale neighbor's age exceeds this
+    NEIGHBOR_INFLUENCE_DECAY_WINDOW: float = 1.0   # s, linear ramp-to-zero window
+    neighbor_decay_enabled: bool = True      # ablation toggle: False = hard cutoff at timeout (pre-fix behavior)
+
+    # Total isolation -> degraded mode -> RTH (Appendix C Phase 5, proposal
+    # Section 6 case 6 / Section 7.3). See update_isolation_rth() below.
+    ISOLATION_RTH_TIMEOUT: float = 6.0       # s, zero reachable neighbors for longer than this triggers rth=True
+
     D_safe: float = 5.0
     D_rep: float = 8.0
     repulsion_gain: float = 4.0
@@ -103,9 +118,21 @@ class DroneState:
 
     # LoRa broadcast-reception throttle (only used when p.lora_broadcast_interval > 0):
     # per-neighbor last-received (position, velocity) and next-due reception time.
-    # Distinct from live ground truth -- see update_neighbor_reception() below.
+    # Distinct from live ground truth -- see update_neighbor_link_state() below.
     neighbor_last_state: dict = field(default_factory=dict)
     neighbor_next_rx_due: dict = field(default_factory=dict)
+
+    # Neighbor-influence decay (Appendix C Phase 5, Section 6 case 3): per-neighbor
+    # last-seen time and current decayed flocking-force weight (1.0 = full trust,
+    # ramping to 0.0 over NEIGHBOR_INFLUENCE_DECAY_WINDOW once out of range).
+    neighbor_last_seen: dict = field(default_factory=dict)
+    neighbor_influence: dict = field(default_factory=dict)
+
+    # Total isolation -> degraded mode -> RTH (Appendix C Phase 5, Section 6 case
+    # 6 / Section 7.3). See update_isolation_rth() below.
+    degraded_mode: bool = False
+    isolated_since: float = -1.0
+    rth: bool = False
 
     def reported_pos(self) -> np.ndarray:
         return self.pos + (self.spoof_offset if self.byzantine else 0.0)
@@ -156,32 +183,61 @@ def wifi_graph(states: dict[int, DroneState], comm_range_wifi: float) -> dict[in
     return comm_graph(states, comm_range_wifi)
 
 
-def update_neighbor_reception(states: dict[int, DroneState], adj: dict[int, set[int]],
-                               p: ElectionParams, t: float) -> None:
-    """Throttles how often each drone's view of a reachable neighbor's state
-    actually refreshes, modeling Tomoto/LoRa's real broadcast rate instead of
-    assuming continuous live telemetry -- mirrors swarm_sim_core.py's
-    _update_link_failure_state refresh block (Appendix C, Phase 2).
+def update_neighbor_link_state(states: dict[int, DroneState], adj: dict[int, set[int]],
+                                p: ElectionParams, t: float) -> None:
+    """Combined LoRa broadcast-reception throttle + neighbor-influence decay --
+    mirrors swarm_sim_core.py's _update_link_failure_state in one pass, exactly
+    as that function does (the same neighbor_last_state dict serves both the
+    staleness model and the decay model there, and here).
 
-    No-op when p.lora_broadcast_interval <= 0 (the default), so every scenario
-    that doesn't opt into this keeps flock_force()'s original always-live
-    behavior exactly. MUST be called once per control-loop tick, before
-    flock_force(), for throttling to take effect -- flock_force() itself does
-    not advance time or know what tick it's on.
+    For each still-reachable neighbor: refreshes neighbor_last_state (throttled
+    by lora_broadcast_interval if set, or every call if not) and resets
+    neighbor_influence to 1.0 (full trust).
+
+    For each neighbor that has dropped OUT of range but hasn't yet exceeded
+    NEIGHBOR_STATE_TIMEOUT: holds the frozen last-known state and ramps
+    neighbor_influence linearly to 0.0 over NEIGHBOR_INFLUENCE_DECAY_WINDOW
+    (Appendix C Phase 5, proposal Section 6 case 3) -- or, if
+    neighbor_decay_enabled=False (ablation baseline), keeps full weight right
+    up to the timeout, then drops instantly, isolating exactly the force
+    discontinuity the proposal's Section 6.3 argues decay avoids.
+
+    Past NEIGHBOR_STATE_TIMEOUT: fully excluded, all per-neighbor bookkeeping
+    cleared.
+
+    No-op per neighbor that's simply never been seen (nothing to decay). MUST
+    be called once per control-loop tick, before flock_force(), for either
+    mechanism to take effect -- flock_force() itself does not advance time.
     """
-    if p.lora_broadcast_interval <= 0:
-        return
     for i, a in states.items():
         if not a.healthy:
             continue
-        for j in adj.get(i, set()):
-            nb = states.get(j)
-            if nb is None:
-                continue
-            due = a.neighbor_next_rx_due.get(j)
-            if due is None or t >= due:
-                a.neighbor_last_state[j] = (nb.pos.copy(), nb.vel.copy())
-                a.neighbor_next_rx_due[j] = t + p.lora_broadcast_interval
+        reachable_ids = adj.get(i, set())
+        for j in list(a.neighbor_influence.keys()) + list(reachable_ids):
+            if j in reachable_ids:
+                a.neighbor_last_seen[j] = t
+                a.neighbor_influence[j] = 1.0
+                nb = states.get(j)
+                if nb is not None:
+                    if p.lora_broadcast_interval <= 0:
+                        a.neighbor_last_state[j] = (nb.pos.copy(), nb.vel.copy())
+                    else:
+                        due = a.neighbor_next_rx_due.get(j)
+                        if due is None or t >= due:
+                            a.neighbor_last_state[j] = (nb.pos.copy(), nb.vel.copy())
+                            a.neighbor_next_rx_due[j] = t + p.lora_broadcast_interval
+            else:
+                last = a.neighbor_last_seen.get(j, -1e9)
+                age = t - last
+                if age > p.NEIGHBOR_STATE_TIMEOUT:
+                    a.neighbor_influence.pop(j, None)
+                    a.neighbor_last_seen.pop(j, None)
+                    a.neighbor_last_state.pop(j, None)
+                    a.neighbor_next_rx_due.pop(j, None)
+                elif not p.neighbor_decay_enabled:
+                    a.neighbor_influence[j] = 1.0
+                else:
+                    a.neighbor_influence[j] = max(0.0, 1 - age / p.NEIGHBOR_INFLUENCE_DECAY_WINDOW)
 
 
 def clusters(adj: dict[int, set[int]]) -> list[set[int]]:
@@ -200,6 +256,60 @@ def clusters(adj: dict[int, set[int]]) -> list[set[int]]:
         seen |= comp
         out.append(comp)
     return out
+
+
+# ------------------------------------------------------- degradation tiers ----
+
+def tier_of(hw_id: int, states: dict[int, DroneState], adj: dict[int, set[int]],
+            cluster_list: list[set[int]]) -> str | None:
+    """Classifies hw_id into one of the proposal's four degradation tiers
+    (Section 9.2) -- swarm_sim_core.py::_tier_of. None if unhealthy (crashed,
+    not meaningfully in any tier)."""
+    a = states[hw_id]
+    if not a.healthy:
+        return None
+    reachable_ids = adj.get(hw_id, set())
+    if not reachable_ids:
+        return "isolated"
+    main_cluster = max(cluster_list, key=len) if cluster_list else set()
+    in_main = hw_id in main_cluster
+    my_cluster = next((c for c in cluster_list if hw_id in c), set())
+    master_id = next((i for i in my_cluster if states[i].is_master), None)
+    if master_id is None:
+        return "isolated"
+    if hw_id == master_id:
+        return "full" if in_main else "partition"
+    direct = master_id in reachable_ids
+    if not in_main:
+        return "partition"
+    return "full" if direct else "relay"
+
+
+def update_isolation_rth(states: dict[int, DroneState], adj: dict[int, set[int]],
+                          p: ElectionParams, t: float) -> None:
+    """Total-isolation -> degraded-mode -> RTH-trigger state machine (Appendix C
+    Phase 5, proposal Section 6 case 6 / Section 7.3) -- swarm_sim_core.py's
+    corresponding block in _update_link_failure_state. A drone with zero
+    reachable neighbors enters degraded_mode immediately (flock_force reads
+    this to drop cohesion and alignment, keeping only repulsion + goal-seeking)
+    and sets rth=True once isolated longer than ISOLATION_RTH_TIMEOUT.
+    Reconnecting clears both. Does NOT itself call PX4's return_to_launch() --
+    that MAVSDK call is the caller's job (realtime_swarm_dynamic.py), triggered
+    by watching rth flip False->True, so this module stays MAVSDK-free like
+    the rest of it. MUST be called once per control-loop tick."""
+    for i, a in states.items():
+        if not a.healthy:
+            continue
+        reachable_ids = adj.get(i, set())
+        if not reachable_ids:
+            if a.isolated_since < 0:
+                a.isolated_since = t
+            a.degraded_mode = True
+            if t - a.isolated_since > p.ISOLATION_RTH_TIMEOUT:
+                a.rth = True
+        else:
+            a.isolated_since = -1.0
+            a.degraded_mode = False
 
 
 # ------------------------------------------------------------------ election ----
@@ -376,27 +486,36 @@ class ElectionState:
 # -------------------------------------------------------------- flocking ----
 
 def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParams) -> np.ndarray:
-    """swarm_sim_core.py::_flock_force, without the neighbor-influence-decay
-    machinery (that needs real link-timeout state the centralized sim doesn't
-    yet track per Phase 5 of the hardware roadmap) -- repulsion, cohesion,
-    distance-dependent alignment, plus goal-seeking, over currently-reachable
-    neighbors only.
+    """swarm_sim_core.py::_flock_force -- repulsion, cohesion, distance-dependent
+    alignment, plus goal-seeking, over the union of currently-reachable AND
+    recently-stale-but-still-decaying neighbors (Appendix C Phase 5, proposal
+    Section 6 case 3). Without that union, the decay weight
+    update_neighbor_link_state() computes would never actually reach this
+    function, since a stale neighbor isn't in adj anymore.
 
-    When p.lora_broadcast_interval > 0, uses each neighbor's last-RECEIVED
-    state (set by update_neighbor_reception(), called once per tick by the
-    caller before this) rather than live ground truth -- modeling Tomoto/LoRa's
-    real broadcast rate per the safety question Appendix C Phase 2 raises and
-    the companion proposal's Section 10.4 sweep answers empirically (safe
-    through a 5s interval at this engine's default parameters, fails sharply
-    past 5.5s). Defaults to the original always-live behavior when disabled."""
+    When p.lora_broadcast_interval > 0, a currently-reachable neighbor's state
+    is throttled (last-RECEIVED, possibly stale, set by
+    update_neighbor_link_state() -- call once per tick, before this) rather
+    than live ground truth, modeling Tomoto/LoRa's real broadcast rate per the
+    companion proposal's Section 10.4 sweep (safe through a 5s interval at this
+    engine's default parameters, fails sharply past 5.5s). A stale (out-of-range)
+    neighbor always uses its frozen last-known state regardless of this setting,
+    since there is by definition no live state to read.
+
+    update_neighbor_link_state() must be called once per tick for decay to take
+    effect; if it's never called, neighbor_influence stays empty and every
+    neighbor force is full-weight -- i.e. this degrades to the pre-decay
+    hard-cutoff behavior automatically, not a separate code path."""
     a = states[hw_id]
+    live_ids = adj.get(hw_id, set())
+    stale_ids = set(a.neighbor_influence.keys()) - live_ids
     f_rep = np.zeros(2)
     f_coh = np.zeros(2)
     f_align = np.zeros(2)
     coh_count = 0
 
-    for j in adj.get(hw_id, set()):
-        if p.lora_broadcast_interval <= 0:
+    for j in live_ids | stale_ids:
+        if j in live_ids and p.lora_broadcast_interval <= 0:
             b_pos, b_vel = states[j].pos, states[j].vel
         else:
             state = a.neighbor_last_state.get(j)
@@ -406,20 +525,21 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
         d = float(np.linalg.norm(a.pos - b_pos))
         if d < 1e-6:
             continue
+        w = a.neighbor_influence.get(j, 1.0)  # decayed weight, Section 6 case 3
 
         if d < p.D_rep:
             strength = p.repulsion_gain * (p.D_rep - d) / max(d, 0.5)
-            f_rep += strength * (a.pos - b_pos) / d
+            f_rep += w * strength * (a.pos - b_pos) / d
 
         if d > p.cohesion_start:
             direction = (b_pos - a.pos) / d
             capped_extent = min(d, p.cohesion_max) - p.cohesion_start
-            f_coh += capped_extent * direction
+            f_coh += w * capped_extent * direction
             coh_count += 1
 
         if d < p.alignment_max_dist:
             align_w = max(0.0, 1 - d / p.alignment_max_dist)
-            f_align += align_w * (b_vel - a.vel)
+            f_align += w * align_w * (b_vel - a.vel)
 
     if coh_count > 0:
         f_coh = p.cohesion_gain * f_coh / coh_count
@@ -428,7 +548,18 @@ def flock_force(hw_id: int, states: dict[int, DroneState], adj, p: ElectionParam
     dist_goal = float(np.linalg.norm(to_goal))
     f_goal = (to_goal / dist_goal) if dist_goal > 1e-6 else np.zeros(2)
 
-    total = f_goal + f_rep + p.alignment_gain * f_align + f_coh
+    if a.degraded_mode:
+        # Sensor-only degraded mode (Section 7.3): drop cohesion and alignment
+        # toward a swarm this drone cannot currently communicate with -- keep
+        # only safety-critical repulsion and goal-seeking. Sourced from
+        # a.degraded_mode, set by update_isolation_rth() -- in practice this is
+        # already near-equivalent to an empty neighbor set (no live or
+        # recently-decaying neighbors survive total isolation long), but
+        # mirrors swarm_sim_core.py's explicit branch rather than relying on
+        # that coincidence, matching the proposal's framing exactly.
+        total = f_goal + f_rep
+    else:
+        total = f_goal + f_rep + p.alignment_gain * f_align + f_coh
 
     mag = float(np.linalg.norm(total))
     if mag > p.max_accel:

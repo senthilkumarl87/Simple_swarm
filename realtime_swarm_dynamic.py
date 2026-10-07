@@ -23,15 +23,28 @@ SCOPE OF THIS PASS:
     What IS now modeled: Tomoto's real broadcast RATE, via --lora-broadcast-interval
     (0 = disabled/continuous, matching every earlier run of this script; > 0 makes
     flock_force() use throttled, possibly-stale received neighbor state instead of
-    live telemetry -- see swarm_election.update_neighbor_reception()).
+    live telemetry -- see swarm_election.update_neighbor_link_state()).
   - No independent ranging sensor behind the eligibility gate's d_AB -- structurally
     explicit now via swarm_election.measured_distance() (p.ranging_available stays
     False on the target hardware; flipping it without a real sensor behind it raises
     rather than silently lying to the gate).
-  - No neighbor-influence decay / link-failure-timeout state machine (Sec. 6) --
-    still Phase 5 scope, intentionally not pulled forward here; a neighbor silently
-    drops out of the flocking force the instant it leaves --comm-range-lora.
-  - No automatic RTH on isolation timeout -- still Phase 5 scope.
+  - Neighbor-influence decay (Sec. 6 case 3, slave<->slave) is now implemented:
+    a neighbor that drops out of --comm-range-lora holds its last-known state and
+    decays its flocking-force weight linearly to zero over
+    --neighbor-influence-decay-window rather than vanishing instantly -- see
+    swarm_election.update_neighbor_link_state(). --no-neighbor-decay reproduces
+    the old hard-cutoff behavior as an ablation baseline.
+  - Total isolation -> degraded mode -> RTH (Sec. 6 case 6 / Sec. 7.3) is now
+    implemented: a drone with zero reachable neighbors drops cohesion/alignment
+    (swarm_election.update_isolation_rth(), flock_force reads a.degraded_mode)
+    and, past --isolation-rth-timeout, this script calls PX4's REAL
+    action.return_to_launch() -- not a simulated flag, per the roadmap's own
+    requirement. Degradation-tier classification (full/relay/partition/isolated,
+    swarm_election.tier_of()) is surfaced in the periodic status line.
+  - MASTER_LINK_TIMEOUT / SLAVE_ACK_TIMEOUT (Sec. 6 cases 1-2) are still not
+    implemented -- remaining Phase 5 scope. Task reassignment (Sec. 7.2) stays
+    blocked on the separate, not-yet-built task-allocation feature regardless
+    of timeout detection.
   - Merge reconciliation on partition rejoin is now EXPLICIT: reconnecting two
     formerly-separate clusters creates a swarm_election.MergeState (winner decided
     immediately via the tie-break chain; a bulk D_merged payload then has to
@@ -88,7 +101,8 @@ from realtime_swarm_mavsdk import (
     graceful_shutdown,
 )
 from swarm_election import (DroneState, ElectionParams, ElectionState, comm_graph, wifi_graph, clusters,
-                             flock_force, update_neighbor_reception, advance_merge_sync)
+                             flock_force, update_neighbor_link_state, advance_merge_sync,
+                             tier_of, update_isolation_rth)
 
 
 # ------------------------------------------------------------- fault injection --
@@ -146,8 +160,13 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         lora_broadcast_interval=args.lora_broadcast_interval,
         lora_bandwidth_bps=args.lora_bandwidth_bps, wifi_bandwidth_bps=args.wifi_bandwidth_bps,
         merge_payload_bytes=args.merge_payload_bytes,
+        NEIGHBOR_STATE_TIMEOUT=args.neighbor_state_timeout,
+        NEIGHBOR_INFLUENCE_DECAY_WINDOW=args.neighbor_influence_decay_window,
+        neighbor_decay_enabled=not args.no_neighbor_decay,
+        ISOLATION_RTH_TIMEOUT=args.isolation_rth_timeout,
     )
     completed_merges = 0
+    rth_triggered: set[int] = set()   # hw_ids we've already fired return_to_launch() for
 
     isolate_windows = {hw_id: (t0, t1) for hw_id, t0, t1 in args.isolate}
 
@@ -183,8 +202,29 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
             for other in severed:
                 adj.get(other, set()).discard(hw_id)
             adj[hw_id] = set()   # still its own singleton cluster, just with no edges
-        update_neighbor_reception(live_states, adj, params, t_rel)   # no-op unless --lora-broadcast-interval > 0
+        update_neighbor_link_state(live_states, adj, params, t_rel)   # throttle + decay, Phase 2/5
+        update_isolation_rth(live_states, adj, params, t_rel)         # degraded_mode + rth trigger, Phase 5
         wifi_adj = wifi_graph(live_states, params.comm_range_wifi)   # empty unless --comm-range-wifi > 0 and in range
+
+        # RTH is a real, consequential MAVSDK action -- fire it exactly once per
+        # drone, on the False->True transition only, not every tick it stays
+        # True (which would spam return_to_launch() calls at the control rate).
+        # Fire-and-forget: a failed RTL call shouldn't block the control loop,
+        # but it IS reported, not silently swallowed.
+        for hw_id, s in live_states.items():
+            if s.rth and hw_id not in rth_triggered and hw_id in drones and not args.dry_run:
+                rth_triggered.add(hw_id)
+                print(f"[rth] t={t_rel:6.1f}s  hw_id {hw_id}: isolated longer than "
+                      f"{params.ISOLATION_RTH_TIMEOUT}s -- calling return_to_launch()")
+
+                async def _do_rth(hw_id=hw_id):
+                    try:
+                        await drones[hw_id].action.return_to_launch()
+                        print(f"[rth] hw_id {hw_id}: return_to_launch() accepted")
+                    except Exception as e:
+                        print(f"[rth] hw_id {hw_id}: return_to_launch() FAILED: {e}")
+
+                asyncio.create_task(_do_rth())
 
         for cluster_ids in clusters(adj):
             master = election.run_election(cluster_ids, live_states, adj, params, t_rel, "periodic")
@@ -214,11 +254,22 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         election.pending_merges = still_pending
 
         for i in follower_ids:
-            # Isolated drones now flow through the normal path: with adj[i] severed
-            # to empty above, flock_force naturally reduces to goal-seeking only
-            # (no neighbors to repel/cohere/align against) -- a more realistic
-            # degraded-but-still-autonomous behavior than halting in place, and the
-            # one that lets it genuinely diverge toward its own election outcome.
+            if i in rth_triggered:
+                # Confirmed empirically (live SITL): PX4 does NOT get pulled back
+                # into OFFBOARD just because set_position_velocity_ned() keeps
+                # arriving -- only offboard.start() requests that mode switch, and
+                # this script never re-calls it, so RETURN_TO_LAUNCH held steady
+                # for the rest of a test run with the send loop left running. Not
+                # unsafe, but pointless and confusing: once a drone is told to
+                # RTH, this is the one place that intent should actually show up
+                # in the code, not just in a log line. Skip it entirely.
+                continue
+            # Isolated (but not yet RTH-triggered) drones flow through the normal
+            # path: with adj[i] severed to empty above, flock_force naturally
+            # reduces to goal-seeking only (no neighbors to repel/cohere/align
+            # against) -- a more realistic degraded-but-still-autonomous behavior
+            # than halting in place, and the one that lets it genuinely diverge
+            # toward its own election outcome.
             force = flock_force(i, live_states, adj, params)
             s = states[i]
             new_vel = s.vel + force * period
@@ -247,9 +298,11 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
             last_status = now
             masters = {i: live_states[i].is_master for i in follower_ids if i in live_states}
             cur = [i for i, m in masters.items() if m]
+            cluster_list = clusters(adj)
+            tiers = {i: tier_of(i, live_states, adj, cluster_list) for i in follower_ids if i in live_states}
             print(f"[status] t={t_rel:5.1f}s  master(s)={cur}  "
-                  f"isolated={sorted(isolated_now) or '-'}  clusters={len(clusters(adj))}  "
-                  f"pending_merges={len(election.pending_merges)}")
+                  f"isolated={sorted(isolated_now) or '-'}  clusters={len(cluster_list)}  "
+                  f"pending_merges={len(election.pending_merges)}  tiers={tiers}")
 
         tick += 1
         sleep_for = (start_mono + tick * period) - time.monotonic()
@@ -382,6 +435,19 @@ def main():
                     help="placeholder D_merged (coverage/task database) size in bytes -- the real task-allocation "
                          "feature that would define this isn't built yet; this lets the merge sync TIMING "
                          "mechanism be exercised now without waiting on that unrelated feature.")
+    p.add_argument("--neighbor-state-timeout", type=float, default=2.0,
+                    help="s, a neighbor out of --comm-range-lora longer than this is fully excluded from flocking "
+                         "(scenario 6 case 3, Section 6 of the proposal)")
+    p.add_argument("--neighbor-influence-decay-window", type=float, default=1.0,
+                    help="s, a neighbor's flocking-force weight ramps linearly from 1.0 to 0.0 over this window "
+                         "after dropping out of range, rather than vanishing instantly")
+    p.add_argument("--no-neighbor-decay", action="store_true",
+                    help="ablation baseline: full weight right up to --neighbor-state-timeout, then an instant "
+                         "drop, instead of the linear decay -- isolates the force-discontinuity comparison the "
+                         "proposal's Section 6.3 argues decay avoids")
+    p.add_argument("--isolation-rth-timeout", type=float, default=6.0,
+                    help="s, zero reachable neighbors for longer than this triggers a real return_to_launch() "
+                         "call (scenario 8, Section 6 case 6 / Section 7.3 of the proposal). Ignored in --dry-run.")
     p.add_argument("--goal-n", type=float, default=20.0, help="m, shared goal offset (north) from each drone's own start position")
     p.add_argument("--goal-e", type=float, default=0.0, help="m, shared goal offset (east) from each drone's own start position")
     p.add_argument("--takeoff-alt", type=float, default=10.0)
