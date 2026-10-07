@@ -52,6 +52,17 @@ SCOPE OF THIS PASS:
     sped up opportunistically over WiFi when in range, matching the LoRa-primary
     design rule) rather than treating the election outcome alone as "merged." See
     --merge-payload-bytes / --lora-bandwidth-bps / --wifi-bandwidth-bps.
+  - L_i (the suitability score's compute/load term) now reads this PROCESS's real
+    CPU load via os.getloadavg() instead of a hardcoded 1.0 -- but this script is
+    still a SINGLE CENTRALIZED process simulating every drone's companion PC, so
+    every drone gets the SAME real-but-shared measurement, not genuine per-drone
+    telemetry. Real per-drone L_i needs each drone to run its own separate
+    companion-PC process (Phase 6+ bench hardware-in-the-loop), which this
+    centralized-simulator architecture cannot produce honestly -- faking per-drone
+    variation here would be worse than the constant it replaces. --compute-capacity
+    HW_ID:VALUE overrides a specific drone's value after the shared real read, so
+    the scoring mechanism's sensitivity to L_i can still be tested even though the
+    live default can't differentiate between drones yet.
 
 FAULT INJECTION (for exercising the scenarios in the proposal's Section 9.3):
   --crash HW_ID              never connect/arm this drone -- simulates scenario 2
@@ -74,6 +85,7 @@ general SITL setup (mavsdk_server per drone, start_multi_px4.sh).
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 import time
@@ -118,6 +130,32 @@ def parse_byzantine(spec: str):
 def parse_isolate(spec: str):
     hw_id_s, t0_s, t1_s = spec.split(":")
     return int(hw_id_s), float(t0_s), float(t1_s)
+
+
+def parse_compute_capacity(spec: str):
+    hw_id_s, val_s = spec.split(":")
+    return int(hw_id_s), float(val_s)
+
+
+def compute_capacity_from_load() -> float:
+    """Real (not hardcoded) L_i source: this PROCESS's current CPU load, inverted
+    and normalized to 0..1 (1.0 = plenty of spare capacity, 0.0 = fully loaded).
+    Threshold matches the px4-gazebo-ros2-sim skill's own load-settling convention
+    (target = 1.6 * cpu_count treated as "fully loaded") for consistency with the
+    rest of this project's tooling, not because 1.6 is independently validated.
+
+    Honest limitation (see module docstring): this script is one centralized
+    process simulating every drone's companion PC, so this is a single
+    PROCESS-WIDE measurement applied to every drone alike -- not per-drone
+    telemetry, which doesn't exist until each drone runs its own separate
+    companion-PC process (Phase 6+)."""
+    try:
+        load1, _, _ = os.getloadavg()
+    except (OSError, AttributeError):
+        return 1.0  # not available on this platform -- fall back to "full capacity"
+    cpu_count = os.cpu_count() or 1
+    fully_loaded_at = 1.6 * cpu_count
+    return float(max(0.0, min(1.0, 1.0 - load1 / fully_loaded_at)))
 
 
 # --------------------------------------------------------- telemetry polling ----
@@ -169,6 +207,7 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
     rth_triggered: set[int] = set()   # hw_ids we've already fired return_to_launch() for
 
     isolate_windows = {hw_id: (t0, t1) for hw_id, t0, t1 in args.isolate}
+    compute_capacity_overrides = dict(args.compute_capacity)
 
     cmd_logs = {fid: [] for fid in follower_ids}
     last_status = 0.0
@@ -196,6 +235,14 @@ async def control_loop(args, drones: dict, states: dict, logs: dict, stop: async
         # the scenario it was meant to produce.
         isolated_now = {hw_id for hw_id, (t0, t1) in isolate_windows.items() if t0 <= t_rel < t1}
         live_states = states
+
+        # L_i source: real (shared-process) CPU load by default, --compute-capacity
+        # override where given -- see compute_capacity_from_load()'s docstring for
+        # why this is honest-but-shared rather than genuine per-drone telemetry.
+        shared_capacity = compute_capacity_from_load()
+        for hw_id, s in live_states.items():
+            s.compute_capacity = compute_capacity_overrides.get(hw_id, shared_capacity)
+
         adj = comm_graph(live_states, params.comm_range_lora)    # PRIMARY link only -- see swarm_election.py docstring
         for hw_id in isolated_now:
             severed = adj.pop(hw_id, set())
@@ -465,6 +512,11 @@ def main():
                     help="sever every comm-graph edge to/from this drone during [T0,T1) seconds -- it stays a "
                          "genuine singleton participant, not removed from the graph (scenario 8: temporary "
                          "isolation; reconnection afterward can trigger a real merge event)")
+    p.add_argument("--compute-capacity", type=parse_compute_capacity, action="append", default=[],
+                    metavar="HW_ID:VALUE",
+                    help="override L_i (0..1) for this drone, after the shared real-CPU-load read -- lets the "
+                         "suitability score's sensitivity to L_i be tested even though the live default can't "
+                         "yet differentiate between drones (see compute_capacity_from_load()'s docstring)")
     args = p.parse_args()
 
     try:
