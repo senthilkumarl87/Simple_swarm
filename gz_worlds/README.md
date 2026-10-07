@@ -83,8 +83,21 @@ PX4's offboard setpoint go stale, so `offboard.start()` failed with `NO_SETPOINT
 setpoint during the wait); and the "skip if already in air" check trusted a fresh connection's first `in_air()`
 read alone, which can be stale, leaving one drone motionless on the ground for a whole run while the others flew
 (fixed by also requiring `armed`). Separately, one PX4 instance's EKF2 got persistently stuck despite Gazebo
-publishing real sensor data and a sane physics pose -- not root-caused, worked around by restarting just that one
-PX4 process (re-attach via `PX4_GZ_MODEL_NAME`, no Gazebo restart needed).
+publishing real sensor data and a sane physics pose -- at the time, worked around by restarting just that one PX4
+process (re-attach via `PX4_GZ_MODEL_NAME`, no Gazebo restart needed).
+
+**Revisited and corrected**: reproduced deliberately under artificial CPU contention (5 busy-loop processes, load
+10-19 on 8 cores) and confirmed via real `ESTIMATOR_STATUS` telemetry (reached non-interactively via a small
+`pymavlink` script against PX4's GCS UDP port) that Gazebo's IMU data stayed clean and correctly timed (250 Hz,
+4 ms steps) on the stuck instance throughout -- not a missing/malformed-data problem. Given enough elapsed time
+(several minutes, not the ~30-90s originally waited), **both** previously "stuck" instances across two separate
+reproductions recovered on their own, with no process restart. The original "restart fixes it" conclusion was
+very likely a false correlation -- the restart cycle's own delay probably just supplied enough elapsed time for
+convergence. Revised understanding: a genuine but slow EKF2 convergence delay under CPU starvation, not a broken
+state needing intervention. Practical implication: a script polling health/armability with a short timeout under
+heavy contention will misdiagnose "still converging" as "stuck." Not changed in code (a longer default timeout
+trades off against normal-case responsiveness, a deliberate choice rather than a silent bump) but named here so
+this isn't mistaken for a structural bug requiring a restart workaround again.
 
 Example command (3 drones, matching `multi_x500_static.sdf`'s declared positions):
 
